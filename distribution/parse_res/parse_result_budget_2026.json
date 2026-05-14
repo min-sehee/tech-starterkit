@@ -1,0 +1,411 @@
+{
+  "api": "2.0",
+  "content": {
+    "html": "<p id='0' data-category='paragraph' style='font-size:14px'>(주)넥스트코어</p>\n<br><h1 id='1' style='font-size:20px'>2026년 부서별 연간 예산 계획</h1>\n<br><p id='2' data-category='paragraph' style='font-size:14px'>문서번호: FIN-2026-BDG-001 │ 기준일: 2026년 1월 1일 │ 보안등급: 내부용</p>\n<h1 id='3' style='font-size:18px'>1. 예산 총괄 요약</h1>\n<table id='4' style='font-size:16px'><thead><tr><td>부서</td><td>팀명</td><td>총 예산(원)</td><td>전년 대비</td></tr></thead><tbody><tr><td>전략기획부</td><td>전략기획팀</td><td>1,200,000,000</td><td>+8.2%</td></tr><tr><td>IT개발부</td><td>개발팀</td><td>1,800,000,000</td><td>+12.5%</td></tr><tr><td>경영지원부</td><td>경영지원팀</td><td>600,000,000</td><td>+3.0%</td></tr><tr><td colspan=\"2\">합계</td><td>3,600,000,000</td><td>+9.1%</td></tr></tbody></table>\n<h1 id='5' style='font-size:18px'>2. 전략기획팀 세부 예산</h1>\n<table id='6' style='font-size:16px'><thead><tr><td>예산 항목</td><td>금액(원)</td><td>비율(%)</td></tr></thead><tbody><tr><td>인건비(Payroll)</td><td>720,000,000</td><td>60%</td></tr><tr><td>운영비(Operations)</td><td>240,000,000</td><td>20%</td></tr><tr><td>프로젝트 예산(Project)</td><td>240,000,000</td><td>20%</td></tr><tr><td>합계</td><td>1,200,000,000</td><td>100%</td></tr></tbody></table>\n<br><p id='7' data-category='list' style='font-size:14px'>▷ 인건비: 팀원 4인(팀장 포함)의 연봉·4대보험·퇴직연금 합산 기준.<br>▷ 프로젝트 예산: PRJ-2026-001(Alpha) 전담 예산 포함.</p>\n<h1 id='8' style='font-size:18px'>3. 개발팀 세부 예산</h1>\n<table id='9' style='font-size:16px'><thead><tr><td>예산 항목</td><td>금액(원)</td><td>비율(%)</td></tr></thead><tbody><tr><td>인건비(Payroll)</td><td>1,080,000,000</td><td>60%</td></tr><tr><td>운영비(Operations)</td><td>360,000,000</td><td>20%</td></tr><tr><td>기술 투자(R&D/Infra)</td><td>360,000,000</td><td>20%</td></tr><tr><td>합계</td><td>1,800,000,000</td><td>100%</td></tr></tbody></table>\n<h1 id='10' style='font-size:18px'>4. 경영지원팀 세부 예산</h1>\n<table id='11' style='font-size:16px'><thead><tr><td>예산 항목</td><td>금액(원)</td><td>비율(%)</td></tr></thead><tbody><tr><td>인건비(Payroll)</td><td>330,000,000</td><td>55%</td></tr><tr><td>운영비(Operations)</td><td>180,000,000</td><td>30%</td></tr></tbody></table>\n<table id='12' style='font-size:18px'><thead></thead><tbody><tr><td>외부 자문비</td><td>90,000,000</td><td>15%</td></tr><tr><td>합계</td><td>600,000,000</td><td>100%</td></tr></tbody></table>\n<p id='13' data-category='paragraph' style='font-size:14px'>※ 본 예산 계획은 이사회 승인(2026-01-07) 기준이며, 분기별 실집행액과 대조하여 관리됩니다.</p>",
+    "markdown": "",
+    "text": ""
+  },
+  "elements": [
+    {
+      "category": "paragraph",
+      "content": {
+        "html": "<p id='0' data-category='paragraph' style='font-size:14px'>(주)넥스트코어</p>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.1256,
+          "y": 0.0801
+        },
+        {
+          "x": 0.2207,
+          "y": 0.0801
+        },
+        {
+          "x": 0.2207,
+          "y": 0.094
+        },
+        {
+          "x": 0.1256,
+          "y": 0.094
+        }
+      ],
+      "id": 0,
+      "page": 1
+    },
+    {
+      "category": "heading1",
+      "content": {
+        "html": "<br><h1 id='1' style='font-size:20px'>2026년 부서별 연간 예산 계획</h1>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.1257,
+          "y": 0.1021
+        },
+        {
+          "x": 0.5231,
+          "y": 0.1021
+        },
+        {
+          "x": 0.5231,
+          "y": 0.1253
+        },
+        {
+          "x": 0.1257,
+          "y": 0.1253
+        }
+      ],
+      "id": 1,
+      "page": 1
+    },
+    {
+      "category": "paragraph",
+      "content": {
+        "html": "<br><p id='2' data-category='paragraph' style='font-size:14px'>문서번호: FIN-2026-BDG-001 │ 기준일: 2026년 1월 1일 │ 보안등급: 내부용</p>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.126,
+          "y": 0.1333
+        },
+        {
+          "x": 0.6183,
+          "y": 0.1333
+        },
+        {
+          "x": 0.6183,
+          "y": 0.1486
+        },
+        {
+          "x": 0.126,
+          "y": 0.1486
+        }
+      ],
+      "id": 2,
+      "page": 1
+    },
+    {
+      "category": "heading1",
+      "content": {
+        "html": "<h1 id='3' style='font-size:18px'>1. 예산 총괄 요약</h1>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.126,
+          "y": 0.184
+        },
+        {
+          "x": 0.3052,
+          "y": 0.184
+        },
+        {
+          "x": 0.3052,
+          "y": 0.2035
+        },
+        {
+          "x": 0.126,
+          "y": 0.2035
+        }
+      ],
+      "id": 3,
+      "page": 1
+    },
+    {
+      "category": "table",
+      "content": {
+        "html": "<table id='4' style='font-size:16px'><thead><tr><td>부서</td><td>팀명</td><td>총 예산(원)</td><td>전년 대비</td></tr></thead><tbody><tr><td>전략기획부</td><td>전략기획팀</td><td>1,200,000,000</td><td>+8.2%</td></tr><tr><td>IT개발부</td><td>개발팀</td><td>1,800,000,000</td><td>+12.5%</td></tr><tr><td>경영지원부</td><td>경영지원팀</td><td>600,000,000</td><td>+3.0%</td></tr><tr><td colspan=\"2\">합계</td><td>3,600,000,000</td><td>+9.1%</td></tr></tbody></table>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.094,
+          "y": 0.2144
+        },
+        {
+          "x": 0.9049,
+          "y": 0.2144
+        },
+        {
+          "x": 0.9049,
+          "y": 0.3464
+        },
+        {
+          "x": 0.094,
+          "y": 0.3464
+        }
+      ],
+      "id": 4,
+      "page": 1
+    },
+    {
+      "category": "heading1",
+      "content": {
+        "html": "<h1 id='5' style='font-size:18px'>2. 전략기획팀 세부 예산</h1>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.1248,
+          "y": 0.3739
+        },
+        {
+          "x": 0.3698,
+          "y": 0.3739
+        },
+        {
+          "x": 0.3698,
+          "y": 0.3936
+        },
+        {
+          "x": 0.1248,
+          "y": 0.3936
+        }
+      ],
+      "id": 5,
+      "page": 1
+    },
+    {
+      "category": "table",
+      "content": {
+        "html": "<table id='6' style='font-size:16px'><thead><tr><td>예산 항목</td><td>금액(원)</td><td>비율(%)</td></tr></thead><tbody><tr><td>인건비(Payroll)</td><td>720,000,000</td><td>60%</td></tr><tr><td>운영비(Operations)</td><td>240,000,000</td><td>20%</td></tr><tr><td>프로젝트 예산(Project)</td><td>240,000,000</td><td>20%</td></tr><tr><td>합계</td><td>1,200,000,000</td><td>100%</td></tr></tbody></table>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.0942,
+          "y": 0.4039
+        },
+        {
+          "x": 0.905,
+          "y": 0.4039
+        },
+        {
+          "x": 0.905,
+          "y": 0.5366
+        },
+        {
+          "x": 0.0942,
+          "y": 0.5366
+        }
+      ],
+      "id": 6,
+      "page": 1
+    },
+    {
+      "category": "list",
+      "content": {
+        "html": "<br><p id='7' data-category='list' style='font-size:14px'>▷ 인건비: 팀원 4인(팀장 포함)의 연봉·4대보험·퇴직연금 합산 기준.<br>▷ 프로젝트 예산: PRJ-2026-001(Alpha) 전담 예산 포함.</p>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.1271,
+          "y": 0.5416
+        },
+        {
+          "x": 0.5365,
+          "y": 0.5416
+        },
+        {
+          "x": 0.5365,
+          "y": 0.5768
+        },
+        {
+          "x": 0.1271,
+          "y": 0.5768
+        }
+      ],
+      "id": 7,
+      "page": 1
+    },
+    {
+      "category": "heading1",
+      "content": {
+        "html": "<h1 id='8' style='font-size:18px'>3. 개발팀 세부 예산</h1>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.1249,
+          "y": 0.6123
+        },
+        {
+          "x": 0.3264,
+          "y": 0.6123
+        },
+        {
+          "x": 0.3264,
+          "y": 0.6311
+        },
+        {
+          "x": 0.1249,
+          "y": 0.6311
+        }
+      ],
+      "id": 8,
+      "page": 1
+    },
+    {
+      "category": "table",
+      "content": {
+        "html": "<table id='9' style='font-size:16px'><thead><tr><td>예산 항목</td><td>금액(원)</td><td>비율(%)</td></tr></thead><tbody><tr><td>인건비(Payroll)</td><td>1,080,000,000</td><td>60%</td></tr><tr><td>운영비(Operations)</td><td>360,000,000</td><td>20%</td></tr><tr><td>기술 투자(R&D/Infra)</td><td>360,000,000</td><td>20%</td></tr><tr><td>합계</td><td>1,800,000,000</td><td>100%</td></tr></tbody></table>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.0942,
+          "y": 0.6419
+        },
+        {
+          "x": 0.9052,
+          "y": 0.6419
+        },
+        {
+          "x": 0.9052,
+          "y": 0.7744
+        },
+        {
+          "x": 0.0942,
+          "y": 0.7744
+        }
+      ],
+      "id": 9,
+      "page": 1
+    },
+    {
+      "category": "heading1",
+      "content": {
+        "html": "<h1 id='10' style='font-size:18px'>4. 경영지원팀 세부 예산</h1>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.1244,
+          "y": 0.8019
+        },
+        {
+          "x": 0.3697,
+          "y": 0.8019
+        },
+        {
+          "x": 0.3697,
+          "y": 0.8215
+        },
+        {
+          "x": 0.1244,
+          "y": 0.8215
+        }
+      ],
+      "id": 10,
+      "page": 1
+    },
+    {
+      "category": "table",
+      "content": {
+        "html": "<table id='11' style='font-size:16px'><thead><tr><td>예산 항목</td><td>금액(원)</td><td>비율(%)</td></tr></thead><tbody><tr><td>인건비(Payroll)</td><td>330,000,000</td><td>55%</td></tr><tr><td>운영비(Operations)</td><td>180,000,000</td><td>30%</td></tr></tbody></table>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.0944,
+          "y": 0.8324
+        },
+        {
+          "x": 0.9051,
+          "y": 0.8324
+        },
+        {
+          "x": 0.9051,
+          "y": 0.9119
+        },
+        {
+          "x": 0.0944,
+          "y": 0.9119
+        }
+      ],
+      "id": 11,
+      "page": 1
+    },
+    {
+      "category": "table",
+      "content": {
+        "html": "<table id='12' style='font-size:18px'><thead></thead><tbody><tr><td>외부 자문비</td><td>90,000,000</td><td>15%</td></tr><tr><td>합계</td><td>600,000,000</td><td>100%</td></tr></tbody></table>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.0939,
+          "y": 0.0805
+        },
+        {
+          "x": 0.905,
+          "y": 0.0805
+        },
+        {
+          "x": 0.905,
+          "y": 0.1343
+        },
+        {
+          "x": 0.0939,
+          "y": 0.1343
+        }
+      ],
+      "id": 12,
+      "page": 2
+    },
+    {
+      "category": "paragraph",
+      "content": {
+        "html": "<p id='13' data-category='paragraph' style='font-size:14px'>※ 본 예산 계획은 이사회 승인(2026-01-07) 기준이며, 분기별 실집행액과 대조하여 관리됩니다.</p>",
+        "markdown": "",
+        "text": ""
+      },
+      "coordinates": [
+        {
+          "x": 0.1231,
+          "y": 0.1461
+        },
+        {
+          "x": 0.7041,
+          "y": 0.1461
+        },
+        {
+          "x": 0.7041,
+          "y": 0.1616
+        },
+        {
+          "x": 0.1231,
+          "y": 0.1616
+        }
+      ],
+      "id": 13,
+      "page": 2
+    }
+  ],
+  "model": "document-parse-260128",
+  "ocr": false,
+  "usage": {
+    "pages": 2,
+    "standard": [
+      1,
+      2
+    ]
+  }
+}

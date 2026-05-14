@@ -15,6 +15,19 @@ baseline_rag.py — RAG 파이프라인 스켈레톤 (Starter Kit)
 $ python baseline_rag.py
 """
 
+import os
+import re
+import glob
+import json
+import uuid
+import time
+import pickle
+import urllib.request
+import urllib.error
+
+from rank_bm25 import BM25Okapi
+import chromadb
+
 from decryptor import load_test_suite
 from upstage_tracker import UpstageTracker
 from validator import validate
@@ -22,33 +35,293 @@ from validator import validate
 CORPUS_DIR      = "distribution/corpus"
 TEST_SUITE_PATH = "distribution/test_suite/Encrypted_Test_Suite.json"
 
+UPSTAGE_BASE_URL   = "https://api.upstage.ai/v1"
+CHROMA_PERSIST_DIR = ".index_chroma"
+BM25_CACHE_PATH    = ".index_bm25.pkl"
+CHUNKS_CACHE_PATH  = ".index_chunks.pkl"
+MAX_TOKENS         = 512
+EMBED_BATCH_SIZE   = 32
+EMBED_MODEL_DOC    = "solar-embedding-1-large-passage"
+EMBED_MODEL_QUERY  = "solar-embedding-1-large-query"
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # PHASE 1.  인덱스 구축  (오프라인 — 파이프라인 실행 전 1회)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def build_index(corpus_dir: str):
-    """PDF 코퍼스를 파싱·청킹하고 검색 인덱스를 반환합니다.
+def _count_tokens(text: str) -> int:
+    """한국어/영어 혼합 텍스트의 토큰 수 추정 (3자 ≈ 1토큰)"""
+    return max(1, len(text) // 3)
 
-    [TODO] 전략을 선택하고 전부 구현하세요.
 
-    ── 파싱 옵션 ──────────────────────────────────────────────
-    pypdf / pdfplumber         : 텍스트 레이어 추출, 빠름
-    Upstage Document Parse API : 레이아웃 인식, 표·이미지 포함
+def _parse_with_upstage(pdf_path: str, api_key: str) -> list[dict]:
+    """Upstage Document Parse API로 PDF를 파싱하고 elements 목록 반환"""
+    url      = f"{UPSTAGE_BASE_URL}/document-ai/document-parse"
+    filename = os.path.basename(pdf_path)
+    boundary = "Boundary" + uuid.uuid4().hex
 
-    ── 청킹 옵션 ──────────────────────────────────────────────
-    페이지 단위 / 문단 단위 / 고정 토큰 수 / Semantic Chunking
+    with open(pdf_path, "rb") as f:
+        file_bytes = f.read()
 
-    ── 인덱싱 옵션 ────────────────────────────────────────────
-    BM25              : 키워드 기반 검색, 빠름
-    Dense Retrieval   : Upstage Embedding API / sentence-transformers
-    Hybrid (권장)     : BM25 + Dense 결합
-    Vector DB         : ChromaDB / FAISS / Pinecone 등
+    part_header = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'
+        f"Content-Type: application/pdf\r\n\r\n"
+    ).encode("utf-8")
+    part_footer = f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    req = urllib.request.Request(
+        url=url,
+        data=part_header + file_bytes + part_footer,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"Document Parse API 오류 [{e.code}] {filename}: {e.read().decode()}"
+        ) from e
+
+    return result.get("elements", [])
+
+
+_HEADING_LEVELS  = {"heading1": 1, "heading2": 2, "heading3": 3}
+_SKIP_CATEGORIES = {"figure", "chart", "unknown"}
+
+
+def _chunk_elements(elements: list[dict], source: str, max_tokens: int = MAX_TOKENS) -> list[dict]:
+    """elements를 문단 단위로 청킹하고 max_tokens를 초과하면 추가 분할.
+
+    heading1/2/3 를 순서대로 추적해 각 청크에 heading_path 를 부여한다.
+    """
+    chunks = []
+    heading_stack: dict[int, str | None] = {1: None, 2: None, 3: None}
+
+    def _current_path() -> list[str]:
+        return [heading_stack[lvl] for lvl in (1, 2, 3) if heading_stack[lvl]]
+
+    def _flush(parts: list[str], meta: dict) -> None:
+        if parts:
+            chunks.append({**meta, "text": " ".join(parts)})
+
+    for elem in elements:
+        category = elem.get("category", "")
+        if category in _SKIP_CATEGORIES:
+            continue
+
+        content = elem.get("content", {})
+        text = (
+            content.get("markdown")
+            or content.get("text")
+            or content.get("html")
+            or ""
+        ).strip()
+        if not text:
+            continue
+
+        # heading 이면 스택 갱신 후 하위 레벨 초기화
+        if category in _HEADING_LEVELS:
+            level = _HEADING_LEVELS[category]
+            heading_stack[level] = re.sub(r"^#+\s*", "", text).strip()
+            for sub in range(level + 1, 4):
+                heading_stack[sub] = None
+
+        page = elem.get("page", 0)
+        meta = {
+            "source":       source,
+            "page":         page,
+            "category":     category,
+            "heading_path": _current_path(),   # 현재 섹션 경로
+        }
+
+        if _count_tokens(text) <= max_tokens:
+            chunks.append({**meta, "text": text})
+            continue
+
+        # 긴 element를 문장/줄바꿈 단위로 세분화
+        sentences = re.split(r"(?<=[.!?。])\s+|\n{2,}", text)
+        current_parts: list[str] = []
+        current_tokens = 0
+
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent:
+                continue
+            t = _count_tokens(sent)
+
+            if t > max_tokens:
+                _flush(current_parts, meta)
+                current_parts, current_tokens = [], 0
+                step = max_tokens * 3
+                for i in range(0, len(sent), step):
+                    chunks.append({**meta, "text": sent[i : i + step]})
+            elif current_tokens + t > max_tokens:
+                _flush(current_parts, meta)
+                current_parts, current_tokens = [sent], t
+            else:
+                current_parts.append(sent)
+                current_tokens += t
+
+        _flush(current_parts, meta)
+
+    return chunks
+
+
+def _build_embed_text(chunk: dict) -> str:
+    """청크에 구조 컨텍스트 prefix를 붙여 임베딩용 텍스트를 생성한다.
+
+    원본 텍스트는 그대로 BM25 / ChromaDB documents 에 저장되고,
+    이 함수의 결과만 embedding API 에 전달된다.
+    """
+    heading_path = chunk.get("heading_path", [])
+    parts = [f"문서: {chunk['source']}"]
+    if heading_path:
+        parts.append("섹션: " + " > ".join(heading_path))
+    parts.append(f"페이지: {chunk['page']}")
+    parts.append(f"유형: {chunk['category']}")
+    prefix = "[" + " | ".join(parts) + "]\n"
+    return prefix + chunk["text"]
+
+
+def _embed_with_upstage(
+    texts: list[str],
+    api_key: str,
+    model: str = EMBED_MODEL_DOC,
+) -> list[list[float]]:
+    """Upstage Embedding API 배치 호출 (rate-limit 대비 재시도 포함)"""
+    url = f"{UPSTAGE_BASE_URL}/solar/embeddings"
+    all_embeddings: list[list[float]] = []
+
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[i : i + EMBED_BATCH_SIZE]
+        payload = json.dumps({"model": model, "input": batch}, ensure_ascii=False).encode()
+
+        for attempt in range(3):
+            req = urllib.request.Request(
+                url=url,
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise RuntimeError(
+                    f"Embedding API 오류 [{e.code}]: {e.read().decode()}"
+                ) from e
+
+        data = sorted(result["data"], key=lambda x: x["index"])
+        all_embeddings.extend(d["embedding"] for d in data)
+        print(f"    임베딩 진행: {min(i + EMBED_BATCH_SIZE, len(texts))}/{len(texts)}")
+
+    return all_embeddings
+
+
+def build_index(corpus_dir: str) -> dict:
+    """PDF 코퍼스를 파싱·청킹하고 하이브리드 검색 인덱스를 반환합니다.
+
+    파싱  : Upstage Document Parse API (레이아웃 인식)
+    청킹  : 문단(element) 단위 + 512 토큰 캡
+    인덱싱: BM25 + Upstage Embedding (Hybrid)
+    DB    : ChromaDB (PersistentClient — 재실행 시 캐시 재사용)
 
     Returns:
-        이후 retrieve() 에서 사용할 인덱스 객체 (형식 자유)
+        {
+            "bm25":       BM25Okapi,
+            "chunks":     list[dict],   # text / source / page / category
+            "collection": chromadb.Collection,
+        }
     """
-    raise NotImplementedError("build_index()를 구현하세요.")
+    api_key = os.environ.get("UPSTAGE_API_KEY")
+    if not api_key:
+        raise EnvironmentError("UPSTAGE_API_KEY 환경변수가 설정되지 않았습니다.")
+
+    # ── 캐시 히트: 이미 구축된 인덱스 재사용 ──────────────────────────────
+    if (
+        os.path.exists(BM25_CACHE_PATH)
+        and os.path.exists(CHUNKS_CACHE_PATH)
+        and os.path.isdir(CHROMA_PERSIST_DIR)
+    ):
+        print("  [build_index] 캐시된 인덱스를 로드합니다...")
+        with open(BM25_CACHE_PATH, "rb") as f:
+            bm25 = pickle.load(f)
+        with open(CHUNKS_CACHE_PATH, "rb") as f:
+            chunks = pickle.load(f)
+        chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+        collection = chroma_client.get_collection("rag_index")
+        print(f"  로드 완료: {len(chunks)}개 청크")
+        return {"bm25": bm25, "chunks": chunks, "collection": collection}
+
+    # ── Step 1: PDF 파싱 + 청킹 ───────────────────────────────────────────
+    pdf_paths = sorted(glob.glob(os.path.join(corpus_dir, "*.pdf")))
+    if not pdf_paths:
+        raise FileNotFoundError(f"PDF 파일을 찾을 수 없습니다: {corpus_dir}")
+
+    all_chunks: list[dict] = []
+    for pdf_path in pdf_paths:
+        source = os.path.basename(pdf_path)
+        print(f"  파싱 중: {source}")
+        elements = _parse_with_upstage(pdf_path, api_key)
+        chunks   = _chunk_elements(elements, source=source)
+        all_chunks.extend(chunks)
+        print(f"    → {len(chunks)}개 청크")
+
+    print(f"  총 청크 수: {len(all_chunks)}")
+    texts       = [c["text"] for c in all_chunks]
+    embed_texts = [_build_embed_text(c) for c in all_chunks]  # 구조 컨텍스트 포함
+
+    # ── Step 2: BM25 인덱스 (원본 텍스트 사용) ───────────────────────────
+    print("  BM25 인덱스 생성 중...")
+    bm25 = BM25Okapi([text.split() for text in texts])
+
+    # ── Step 3: Upstage 임베딩 + ChromaDB ────────────────────────────────
+    print("  임베딩 생성 중... (구조 컨텍스트 prefix 포함)")
+    embeddings = _embed_with_upstage(embed_texts, api_key)  # enriched text 임베딩
+
+    print("  ChromaDB 저장 중...")
+    chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+    try:
+        chroma_client.delete_collection("rag_index")
+    except Exception:
+        pass
+    collection = chroma_client.create_collection(
+        "rag_index",
+        metadata={"hnsw:space": "cosine"},
+    )
+    collection.add(
+        documents=texts,  # 검색 결과 표시용은 원본 텍스트
+        embeddings=embeddings,
+        metadatas=[
+            {
+                "source":       c["source"],
+                "page":         c["page"],
+                "category":     c["category"],
+                "heading_path": " > ".join(c.get("heading_path", [])),
+            }
+            for c in all_chunks
+        ],
+        ids=[str(i) for i in range(len(texts))],
+    )
+
+    # ── Step 4: 캐시 저장 ─────────────────────────────────────────────────
+    with open(BM25_CACHE_PATH, "wb") as f:
+        pickle.dump(bm25, f)
+    with open(CHUNKS_CACHE_PATH, "wb") as f:
+        pickle.dump(all_chunks, f)
+
+    print(f"  인덱스 구축 완료: {len(all_chunks)}개 청크")
+    return {"bm25": bm25, "chunks": all_chunks, "collection": collection}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
