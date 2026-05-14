@@ -1,25 +1,22 @@
 # ── 필수 패키지 (반드시 설치) ───────────────────────────────────────────
 pandas>=2.0.0          # submission.csv 생성 및 검증 (validator, upstage_tracker)
 cryptography>=42.0.0   # AES-256-GCM 복호화 (decryptor.py)
+numpy>=1.26.0          # 검색 점수 계산
+pymupdf>=1.24.0        # PDF 파싱 (fitz)
+rank-bm25>=0.2.2       # BM25 keyword retrieval
+scikit-learn>=1.4.0,<1.7.0  # TF-IDF retrieval, 일부 Mac/conda 호환성 고려
+python-dotenv>=1.0.0   # 환경변수 로딩 보조
+tqdm>=4.66.0           # 필요 시 진행률 표시
 
-# ── PDF 파싱 (하나 선택) ─────────────────────────────────────────────────
-# pypdf>=4.0.0          # 텍스트 레이어 추출, 경량
-# pdfplumber>=0.10.0    # 표·레이아웃 추출에 강함
-# (Upstage Document Parse API 사용 시 별도 설치 불필요)
+# ── 선택 패키지 (이번 MVP 기본 구현에서는 사용 안 함) ─────────────────────
+# faiss-cpu>=1.8.0     # Apple Silicon / conda 조합에서 설치 이슈가 잦아 optional 유지
+# pdfplumber>=0.11.0   # 대체 PDF parser
+# pypdf>=4.2.0         # 대체 PDF parser
 
-# ── Vector DB (하나 선택) ────────────────────────────────────────────────
-# chromadb>=0.4.0
-# faiss-cpu>=1.7.4
-# pinecone-client>=3.0.0
-
-# ── 검색 및 임베딩 ───────────────────────────────────────────────────────
-# scikit-learn>=1.4.0   # TF-IDF 기반 검색 (임베딩 없이 간단 구현 시)
-# numpy>=1.26.0
-
-# ── RAG 프레임워크 (선택) ────────────────────────────────────────────────
+# ── 대형 프레임워크 (비추천) ────────────────────────────────────────────
 # langchain>=0.2.0
 # llama-index>=0.10.0
 
 # ── LLM API (Upstage 외 다른 API 사용 시) ───────────────────────────────
-# openai>=1.0.0         # OpenAI / Upstage Solar (OpenAI 호환)
-# anthropic>=0.25.0     # Anthropic Claude
+# openai>=1.0.0
+# anthropic>=0.25.0

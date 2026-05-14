@@ -1,0 +1,6 @@
+question_id,answer,used_tokens,inference_time,token
+Q_001,정보 없음,0,0.0,dummy_token_q001
+Q_002,정보 없음,0,0.0,dummy_token_q002
+Q_003,정보 없음,0,0.0,dummy_token_q003
+Q_061,정보 없음,0,0.0,dummy_token_q061
+Q_081,정보 없음,0,0.0,dummy_token_q081

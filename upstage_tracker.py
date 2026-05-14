@@ -17,9 +17,15 @@ used_tokens 가 0 인 제출은 채점에서 제외됩니다.
 import os
 import time
 import json
+import ssl
 import urllib.request
 import urllib.error
 import pandas as pd
+
+try:
+    import certifi
+except ImportError:  # pragma: no cover - optional dependency guard
+    certifi = None
 
 
 UPSTAGE_BASE_URL = "https://api.upstage.ai/v1"
@@ -133,8 +139,11 @@ class UpstageTracker:
                 "Content-Type":  "application/json",
             },
         )
+        ssl_context = ssl.create_default_context(
+            cafile=certifi.where() if certifi is not None else None
+        )
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, context=ssl_context) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8")
