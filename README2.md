@@ -173,3 +173,192 @@ LLM 응답을 받은 뒤에도 한 번 더 안전 장치를 둡니다.
 - 현재 multi-hop은 로컬 follow-up query 기반이라 매우 정교한 추론형 질문에는 한계가 있음
 
 즉, 이 버전은 “최고 점수용 실험작”보다는 “당일 안정적으로 제출 가능한 실전형 베이스라인”에 가깝습니다.
+
+## 추가 구현 메모: artifacts 로딩과 build_index 변경사항
+
+아래 내용은 기존 설명에 더해, 최근 반영한 `build_index()` 개선과 `artifacts` 재사용 방식에 대한 구현 메모입니다.
+
+### 1. 이번에 추가로 수정한 파일
+
+이번 단계에서 직접 수정한 파일은 아래와 같습니다.
+
+- [baseline_rag.py](/Users/hanjisu/tech-starterkit/baseline_rag.py)
+- [upstage_tracker.py](/Users/hanjisu/tech-starterkit/upstage_tracker.py)
+- [requirements.txt](/Users/hanjisu/tech-starterkit/requirements.txt)
+- [README2.md](/Users/hanjisu/tech-starterkit/README2.md)
+
+추가 생성/활용되는 산출물은 아래입니다.
+
+- [artifacts/chunks.preview.jsonl](/Users/hanjisu/tech-starterkit/artifacts/chunks.preview.jsonl)
+- [submission.csv](/Users/hanjisu/tech-starterkit/submission.csv)
+
+### 2. build_index()를 왜 다시 손봤는가
+
+기존 구현은 로컬 `PyMuPDF(fitz)`로 PDF 텍스트를 바로 읽고 chunk를 만드는 방식이었습니다.  
+이 방식은 단순하고 안정적이지만, 문서 구조가 복잡하거나 표/헤딩 구조가 중요한 PDF에서는 품질이 아쉬울 수 있습니다.
+
+그래서 `origin/parsing-chunking` 브랜치의 `build_index()` 아이디어를 참고해서 아래 순서로 바꿨습니다.
+
+1. 가능하면 `Upstage Document Parse API`로 먼저 파싱 시도
+2. 파싱 결과를 heading/paragraph 기반으로 더 구조적으로 청킹
+3. 그 결과를 `artifacts/chunks.preview.jsonl`에 저장
+4. 다음 실행부터는 artifact를 재사용해서 더 빠르게 시작
+5. Parse API가 실패하면 기존 로컬 `fitz` 파서로 자동 폴백
+
+즉, “품질이 더 나을 수 있는 경로”와 “반드시 돌아가는 경로”를 같이 두는 구조입니다.
+
+### 3. build_index()에서 실제로 구현한 내용
+
+현재 `build_index()`는 아래 분기 구조로 동작합니다.
+
+#### 3-1. artifact가 있으면 먼저 로드
+
+- `artifacts/chunks.preview.jsonl`이 존재하고
+- 코퍼스 PDF보다 artifact가 더 최신이면
+- 인덱스를 새로 만들지 않고 바로 chunk를 로드합니다
+
+이때 로그는 아래처럼 찍힙니다.
+
+- `→ artifacts 로드: artifacts/chunks.preview.jsonl`
+
+즉, 두 번째 실행부터는 PDF 파싱 비용을 줄일 수 있습니다.
+
+#### 3-2. artifact가 없으면 Document Parse 시도
+
+artifact가 없거나 낡았으면 먼저 `Upstage Document Parse API`를 호출합니다.
+
+여기서 구현한 세부 사항:
+
+- multipart/form-data로 PDF 업로드
+- `output_formats=["markdown"]` 요청
+- 응답에서 페이지별 markdown 추출
+- 응답 형식이 약간 달라도 `markdown`, `text`, `content`를 유연하게 파싱
+- page 번호가 비정상이면 재번호 부여
+
+이 부분은 `origin/parsing-chunking`의 장점을 거의 그대로 가져온 영역입니다.
+
+#### 3-3. Document Parse 결과를 구조적으로 chunking
+
+`Document Parse`가 성공하면 아래 순서로 후처리합니다.
+
+- markdown 정규화
+- heading 기준 section 분리
+- paragraph 단위 분리
+- 너무 짧은 문단은 주변 문단과 병합
+- 너무 긴 문단은 word-limit 기준으로 다시 분할
+- 표는 가능한 한 독립 chunk로 유지
+- 문서 머리글성 잡음(`문서번호`, `보안등급` 등)은 제거
+- 너무 짧은 chunk는 삭제 또는 앞/뒤 chunk로 병합
+
+즉, 단순 문자 슬라이딩 윈도우보다 문서 구조를 더 반영하는 청킹 방식입니다.
+
+#### 3-4. Parse 실패 시 로컬 파서 폴백
+
+`Document Parse API`는 rate limit, 네트워크, 권한 문제로 실패할 수 있습니다.  
+실제로 테스트 중에도 `429 too_many_requests`가 발생했습니다.
+
+그래서 아래처럼 폴백합니다.
+
+- Parse 실패 → 경고 출력
+- `extract_pdf_pages()` + `chunk_text()` 기반 로컬 인덱싱 수행
+- 그래도 결과는 `artifacts/chunks.preview.jsonl`에 저장
+
+즉, 외부 API가 막혀도 전체 파이프라인은 죽지 않도록 한 것입니다.
+
+### 4. artifacts/chunks.preview.jsonl은 무엇인가
+
+이 파일은 인덱스 구축 결과를 가볍게 저장해 두는 preview artifact입니다.
+
+각 줄에는 대략 아래 정보가 들어갑니다.
+
+- `text`
+- `metadata.chunk_id`
+- `metadata.source`
+- `metadata.page`
+- `metadata.injection_score`
+- `metadata.is_suspicious`
+
+현재 로직에서는 이 파일을 “검색용 청크 캐시”로 사용합니다.
+
+### 5. artifact 로딩 방식
+
+artifact 로딩은 아래 규칙으로 구현했습니다.
+
+1. `artifacts/chunks.preview.jsonl` 파일 존재 여부 확인
+2. 코퍼스 폴더의 PDF 수정 시각과 artifact 수정 시각 비교
+3. artifact가 더 최신이면 그대로 로드
+4. artifact가 없거나 PDF가 더 최신이면 다시 인덱스 구축
+
+이렇게 하면:
+
+- 코퍼스가 안 바뀌었을 때는 빠르게 재실행 가능
+- 코퍼스가 바뀌면 자동으로 새 인덱스를 만듦
+
+### 6. artifact를 현재 코드에 맞게 어떻게 연결했는가
+
+`origin/parsing-chunking` 브랜치에서는 artifact가 chunk preview 중심이었고, 검색 구조는 지금 코드와 달랐습니다.  
+그래서 현재 버전에 맞게 아래처럼 재연결했습니다.
+
+- artifact에서 읽은 데이터를 현재 검색 로직의 chunk 스키마로 변환
+- `doc_id`, `page`, `chunk_id`, `text`, `injection_score`, `is_suspicious` 형식으로 통일
+- 이후 검색 단계는 로컬 BM25/TF-IDF 로직을 그대로 사용
+
+즉, `build_index()`만 Parse/Artifact 쪽 아이디어를 흡수하고, retrieval 구조는 현재 안정적인 하이브리드 검색을 유지한 것입니다.
+
+### 7. upstage_tracker.py에서 같이 수정한 부분
+
+이 단계에서 `upstage_tracker.py`도 함께 손봤습니다.
+
+- macOS Python에서 발생하던 SSL 인증서 검증 오류 방지
+- `certifi` 기반 CA bundle을 사용하도록 HTTPS 호출 보강
+
+이 수정이 필요한 이유는, 실제로 같은 API 키라도 로컬 Python 인증서 체인이 꼬이면 `CERTIFICATE_VERIFY_FAILED`가 날 수 있었기 때문입니다.
+
+### 8. requirements.txt에서 추가한 이유
+
+이번 구현에 맞춰 아래 패키지를 실제 필수 의존성으로 올렸습니다.
+
+- `pymupdf`
+- `rank-bm25`
+- `scikit-learn`
+- `numpy`
+- `certifi`
+
+의미는 다음과 같습니다.
+
+- `pymupdf`: 로컬 PDF 파싱 fallback
+- `rank-bm25`: 키워드 retrieval
+- `scikit-learn`: TF-IDF retrieval
+- `numpy`: 점수 계산
+- `certifi`: SSL 인증서 안정화
+
+### 9. 실제 실행에서 확인된 동작
+
+실행 결과는 아래처럼 검증했습니다.
+
+#### 1차 실행
+
+- `Document Parse` 시도
+- Upstage Parse API가 `429 too_many_requests`로 실패
+- 로컬 `fitz` 파서로 폴백
+- `artifacts/chunks.preview.jsonl` 생성
+- `submission.csv` 생성 및 validator 통과
+
+#### 2차 실행
+
+- `artifacts/chunks.preview.jsonl` 바로 로드
+- PDF 재파싱 없이 인덱스 구축
+- `submission.csv` 생성 및 validator 통과
+- 중간 응답시간이 더 짧아짐
+
+즉, artifact 재사용 흐름이 실제로 동작하는 것까지 확인했습니다.
+
+### 10. 이 변경의 의미
+
+이번 변경으로 `build_index()`는 아래 세 가지 성질을 동시에 갖게 됐습니다.
+
+- 구조적 파싱이 가능하면 더 좋은 chunk를 만들 수 있음
+- 외부 Parse API가 실패해도 로컬 parser로 끝까지 감
+- artifact를 통해 반복 실행 속도를 개선할 수 있음
+
+정리하면, 이 부분은 “성능 향상 시도”와 “실패 내성”을 같이 확보하기 위해 넣은 변경입니다.

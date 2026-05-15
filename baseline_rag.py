@@ -17,8 +17,12 @@ $ python baseline_rag.py
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import ssl
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +30,11 @@ import numpy as np
 from decryptor import load_test_suite
 from upstage_tracker import UpstageTracker
 from validator import validate
+
+try:
+    import certifi
+except ImportError:  # pragma: no cover
+    certifi = None
 
 try:
     import fitz
@@ -46,6 +55,8 @@ except ImportError:  # pragma: no cover
 CORPUS_DIR = "distribution/corpus"
 TEST_SUITE_PATH = "distribution/test_suite/Encrypted_Test_Suite.json"
 GENERATION_MODEL = "solar-pro"
+UPSTAGE_PARSE_URL = "https://api.upstage.ai/v1/document-ai/document-parse"
+CHUNKS_ARTIFACT_PATH = Path("artifacts/chunks.preview.jsonl")
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 220
 RETRIEVAL_TOP_K = 6
@@ -224,6 +235,392 @@ def extract_pdf_pages(corpus_dir: str) -> list[dict]:
             print(f"  [warn] {pdf_path.name} 파싱 실패: {exc}")
 
     return pages
+
+
+def _artifact_is_usable(corpus_dir: str, artifact_path: Path = CHUNKS_ARTIFACT_PATH) -> bool:
+    if not artifact_path.exists():
+        return False
+    pdf_paths = list(Path(corpus_dir).glob("*.pdf"))
+    if not pdf_paths:
+        return False
+    artifact_mtime = artifact_path.stat().st_mtime
+    latest_pdf_mtime = max(path.stat().st_mtime for path in pdf_paths)
+    return artifact_mtime >= latest_pdf_mtime
+
+
+def _load_chunks_from_artifact(artifact_path: Path = CHUNKS_ARTIFACT_PATH) -> list[dict]:
+    chunks = []
+    with artifact_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            chunk = json.loads(line)
+            metadata = chunk.get("metadata", {})
+            chunks.append(
+                {
+                    "doc_id": metadata.get("source", "unknown"),
+                    "page": metadata.get("page", 0),
+                    "chunk_id": metadata.get("chunk_id", f"artifact_{len(chunks)}"),
+                    "text": clean_text(chunk.get("text", "")),
+                    "injection_score": score_injection(chunk.get("text", "")),
+                    "is_suspicious": score_injection(chunk.get("text", "")) >= 2,
+                    "metadata": metadata,
+                }
+            )
+    return chunks
+
+
+def _save_chunks_artifact(chunks: list[dict], artifact_path: Path = CHUNKS_ARTIFACT_PATH) -> None:
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    with artifact_path.open("w", encoding="utf-8") as f:
+        for chunk in chunks:
+            payload = {
+                "text": chunk["text"],
+                "metadata": {
+                    "chunk_id": chunk["chunk_id"],
+                    "source": chunk["doc_id"],
+                    "page": chunk["page"],
+                    "injection_score": chunk["injection_score"],
+                    "is_suspicious": chunk["is_suspicious"],
+                    **chunk.get("metadata", {}),
+                },
+            }
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _normalize_markdown(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _split_by_headings(markdown: str) -> list[dict]:
+    blocks = re.split(r"(?m)^(#{1,6}\s+.+)$", markdown)
+    sections: list[dict] = []
+    current_section = "ROOT"
+
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        if re.match(r"^#{1,6}\s+.+$", block):
+            current_section = re.sub(r"^#{1,6}\s+", "", block).strip()
+        else:
+            sections.append({"section": current_section, "content": block})
+
+    return sections or [{"section": "ROOT", "content": markdown}]
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    parts = [part.strip() for part in text.split("\n\n") if part.strip()]
+    return parts or [text]
+
+
+def _split_by_word_limit(text: str, target_words: int, overlap_words: int) -> list[str]:
+    words = text.split()
+    if len(words) <= target_words:
+        return [text]
+
+    step = max(1, target_words - overlap_words)
+    chunks = []
+    start = 0
+    while start < len(words):
+        chunks.append(" ".join(words[start:start + target_words]))
+        start += step
+    return chunks
+
+
+def _word_count(text: str) -> int:
+    return len(text.split())
+
+
+def _contains_markdown_table(text: str) -> bool:
+    return bool(re.search(r"(?m)^\|.+\|\s*$", text)) and ("|---" in text or "| ---" in text)
+
+
+def _merge_short_units(units: list[str], min_words: int, target_words: int) -> list[str]:
+    merged: list[str] = []
+    buffer = ""
+
+    for unit in units:
+        unit = unit.strip()
+        if not unit:
+            continue
+
+        if _contains_markdown_table(unit):
+            if buffer.strip():
+                merged.append(buffer.strip())
+                buffer = ""
+            merged.append(unit)
+            continue
+
+        if not buffer:
+            buffer = unit
+            continue
+
+        candidate = f"{buffer}\n\n{unit}"
+        if _word_count(buffer) < min_words or _word_count(candidate) <= target_words:
+            buffer = candidate
+        else:
+            merged.append(buffer.strip())
+            buffer = unit
+
+    if buffer.strip():
+        merged.append(buffer.strip())
+
+    return merged
+
+
+def _is_header_noise_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    patterns = [
+        r"^\(주\)넥스트코어$",
+        r"^문서번호:",
+        r"^계약번호:",
+        r"^기준일:",
+        r"^계약일:",
+        r"^제정일:",
+        r"^보안등급:",
+    ]
+    return any(re.search(pattern, stripped) for pattern in patterns)
+
+
+def _remove_header_noise(text: str) -> str:
+    kept = [line for line in text.splitlines() if not _is_header_noise_line(line)]
+    return "\n".join(kept).strip()
+
+
+def _has_core_value_pattern(text: str) -> bool:
+    patterns = [
+        r"\d{4}[./-]\d{1,2}[./-]\d{1,2}",
+        r"\d[\d,]*\s*(원|만원|억원|%)",
+        r"\b\d[\d,]*\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _postprocess_short_chunks(chunks: list[dict]) -> list[dict]:
+    if not chunks:
+        return chunks
+
+    out = [
+        {
+            "text": chunk["text"],
+            "metadata": dict(chunk.get("metadata", {})),
+        }
+        for chunk in chunks
+    ]
+    keep = [True] * len(out)
+
+    for i, chunk in enumerate(out):
+        if not keep[i]:
+            continue
+        if chunk["metadata"].get("contains_table", False):
+            continue
+
+        text = chunk["text"].strip()
+        words = _word_count(text)
+        source = chunk["metadata"].get("source")
+        page = chunk["metadata"].get("page")
+
+        if 3 <= words <= 8 and not _has_core_value_pattern(text):
+            keep[i] = False
+            continue
+
+        if 9 <= words <= 19:
+            next_idx = None
+            for j in range(i + 1, len(out)):
+                if not keep[j]:
+                    continue
+                if out[j]["metadata"].get("source") != source or out[j]["metadata"].get("page") != page:
+                    break
+                if not out[j]["metadata"].get("contains_table", False):
+                    next_idx = j
+                    break
+
+            if next_idx is not None:
+                out[next_idx]["text"] = f"{text}\n\n{out[next_idx]['text'].strip()}".strip()
+                keep[i] = False
+                continue
+
+            prev_idx = None
+            for j in range(i - 1, -1, -1):
+                if not keep[j]:
+                    continue
+                if out[j]["metadata"].get("source") != source or out[j]["metadata"].get("page") != page:
+                    break
+                if not out[j]["metadata"].get("contains_table", False):
+                    prev_idx = j
+                    break
+
+            if prev_idx is not None:
+                out[prev_idx]["text"] = f"{out[prev_idx]['text'].strip()}\n\n{text}".strip()
+                keep[i] = False
+
+    processed = []
+    for chunk, is_kept in zip(out, keep):
+        if not is_kept or not chunk["text"].strip():
+            continue
+        text = clean_text(chunk["text"])
+        metadata = dict(chunk["metadata"])
+        processed.append(
+            {
+                "doc_id": metadata.get("source", "unknown"),
+                "page": metadata.get("page", 0),
+                "chunk_id": metadata.get("chunk_id", f"processed_{len(processed)}"),
+                "text": text,
+                "injection_score": score_injection(text),
+                "is_suspicious": score_injection(text) >= 2,
+                "metadata": metadata,
+            }
+        )
+    return processed
+
+
+def _as_text(value) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(_as_text(item) for item in value if _as_text(item).strip()).strip()
+    if isinstance(value, dict):
+        for key in ("markdown", "text", "content", "body", "value"):
+            if key in value:
+                nested = _as_text(value[key])
+                if nested.strip():
+                    return nested
+        return json.dumps(value, ensure_ascii=False)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _build_ssl_context():
+    return ssl.create_default_context(cafile=certifi.where() if certifi is not None else None)
+
+
+def _parse_pdf_with_upstage(pdf_path: Path, api_key: str) -> dict:
+    boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+    with pdf_path.open("rb") as f:
+        file_bytes = f.read()
+
+    parts = [
+        f"--{boundary}\r\n".encode("utf-8"),
+        (
+            "Content-Disposition: form-data; name=\"document\"; "
+            f"filename=\"{pdf_path.name}\"\r\n"
+            "Content-Type: application/pdf\r\n\r\n"
+        ).encode("utf-8"),
+        file_bytes,
+        "\r\n".encode("utf-8"),
+        f"--{boundary}\r\n".encode("utf-8"),
+        b"Content-Disposition: form-data; name=\"output_formats\"\r\n\r\n",
+        b"[\"markdown\"]\r\n",
+        f"--{boundary}--\r\n".encode("utf-8"),
+    ]
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        url=UPSTAGE_PARSE_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, context=_build_ssl_context(), timeout=180) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Upstage Parse API 오류 [{e.code}]: {detail}") from e
+
+    pages = []
+    for page in payload.get("pages", []):
+        page_no = page.get("page") or page.get("page_num") or page.get("id") or 0
+        markdown = _as_text(page.get("markdown") or page.get("text") or page.get("content") or "")
+        pages.append({"page": int(page_no) if str(page_no).isdigit() else 0, "markdown": markdown})
+
+    if not pages:
+        whole_markdown = _as_text(payload.get("markdown") or payload.get("content") or payload.get("text") or "")
+        if whole_markdown.strip():
+            pages = [{"page": 1, "markdown": whole_markdown}]
+
+    if not pages:
+        raise RuntimeError(f"문서 파싱 결과가 비어 있습니다: {pdf_path.name}")
+
+    normalized_pages = []
+    for idx, page in enumerate(pages, start=1):
+        page_no = page["page"] if page["page"] > 0 else idx
+        normalized_pages.append({"page": page_no, "markdown": _normalize_markdown(page["markdown"])})
+    return {"source": pdf_path.name, "pages": normalized_pages}
+
+
+def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict]:
+    target_words = 700
+    overlap_words = 100
+    min_chunk_words = 140
+    pdf_files = sorted(Path(corpus_dir).glob("*.pdf"))
+    print(f"  → PDF 수: {len(pdf_files)}개")
+
+    all_chunks: list[dict] = []
+    global_chunk_index = 0
+
+    for pdf_path in pdf_files:
+        parsed = _parse_pdf_with_upstage(pdf_path, api_key)
+        source = parsed["source"]
+
+        for page_obj in parsed["pages"]:
+            page_idx = page_obj["page"]
+            page_markdown = page_obj["markdown"]
+            sections = _split_by_headings(page_markdown)
+
+            for section in sections:
+                section_name = section["section"]
+                paragraph_units = _split_paragraphs(section["content"])
+                merged_units = _merge_short_units(
+                    units=paragraph_units,
+                    min_words=min_chunk_words,
+                    target_words=target_words,
+                )
+
+                for paragraph in merged_units:
+                    final_units = _split_by_word_limit(paragraph, target_words, overlap_words)
+                    for unit in final_units:
+                        text = clean_text(_remove_header_noise(unit))
+                        if not text:
+                            continue
+                        injection_score = score_injection(text)
+                        all_chunks.append(
+                            {
+                                "doc_id": Path(source).stem,
+                                "page": page_idx,
+                                "chunk_id": f"{Path(source).stem}::c{global_chunk_index}",
+                                "text": text,
+                                "injection_score": injection_score,
+                                "is_suspicious": injection_score >= 2,
+                                "metadata": {
+                                    "source": Path(source).stem,
+                                    "page": page_idx,
+                                    "section": section_name,
+                                    "contains_table": _contains_markdown_table(text),
+                                    "pipeline_stage": "document_parse_post_chunk",
+                                    "chunk_index": global_chunk_index,
+                                },
+                            }
+                        )
+                        global_chunk_index += 1
+
+    processed = _postprocess_short_chunks(all_chunks)
+    for idx, chunk in enumerate(processed):
+        chunk["chunk_id"] = f"{chunk['doc_id']}::c{idx}"
+        chunk["metadata"]["chunk_index"] = idx
+        chunk["metadata"]["chunk_id"] = chunk["chunk_id"]
+    return processed
 
 
 def chunk_text(doc_id: str, page: int, text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[dict]:
@@ -462,11 +859,45 @@ def build_index(corpus_dir: str):
         raise ImportError("scikit-learn이 필요합니다. `pip install scikit-learn` 후 다시 실행하세요.")
 
     print("  인덱스 구축 시작")
-    pages = extract_pdf_pages(corpus_dir)
-
+    pages: list[dict] = []
     chunks: list[dict] = []
-    for page in pages:
-        chunks.extend(chunk_text(page["doc_id"], page["page"], page["text"]))
+
+    if _artifact_is_usable(corpus_dir):
+        print(f"  → artifacts 로드: {CHUNKS_ARTIFACT_PATH}")
+        chunks = _load_chunks_from_artifact()
+        for chunk in chunks:
+            pages.append(
+                {
+                    "doc_id": chunk["doc_id"],
+                    "page": chunk["page"],
+                    "text": chunk["text"],
+                }
+            )
+    else:
+        api_key = os.environ.get("UPSTAGE_API_KEY")
+        if api_key:
+            try:
+                print("  → Upstage Document Parse 기반 인덱싱 시도")
+                chunks = _build_chunks_via_document_parse(corpus_dir, api_key)
+                pages = [
+                    {
+                        "doc_id": chunk["doc_id"],
+                        "page": chunk["page"],
+                        "text": chunk["text"],
+                    }
+                    for chunk in chunks
+                ]
+                _save_chunks_artifact(chunks)
+                print(f"  → artifacts 저장: {CHUNKS_ARTIFACT_PATH}")
+            except Exception as exc:
+                print(f"  [warn] Document Parse 실패, local PDF parser로 폴백: {exc}")
+
+        if not chunks:
+            pages = extract_pdf_pages(corpus_dir)
+            for page in pages:
+                chunks.extend(chunk_text(page["doc_id"], page["page"], page["text"]))
+            _save_chunks_artifact(chunks)
+            print(f"  → artifacts 저장: {CHUNKS_ARTIFACT_PATH}")
 
     suspicious_count = sum(1 for chunk in chunks if chunk["is_suspicious"])
     print(f"  → 페이지 수: {len(pages)}개")
