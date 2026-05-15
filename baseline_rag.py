@@ -29,30 +29,57 @@ from validator import validate
 
 try:
     import fitz
-except ImportError:  # pragma: no cover - dependency guard
+except ImportError:  # pragma: no cover
     fitz = None
 
 try:
     from rank_bm25 import BM25Okapi
-except ImportError:  # pragma: no cover - dependency guard
+except ImportError:  # pragma: no cover
     BM25Okapi = None
 
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
-except ImportError:  # pragma: no cover - dependency guard
+except ImportError:  # pragma: no cover
     TfidfVectorizer = None
+
 
 CORPUS_DIR = "distribution/corpus"
 TEST_SUITE_PATH = "distribution/test_suite/Encrypted_Test_Suite.json"
+GENERATION_MODEL = "solar-pro"
 CHUNK_SIZE = 1200
-CHUNK_OVERLAP = 200
+CHUNK_OVERLAP = 220
 RETRIEVAL_TOP_K = 6
-RETRIEVAL_POOL_SIZE = 20
-MAX_CONTEXT_CHARS = 7000
-MIN_PAGE_TEXT_LEN = 20
+RETRIEVAL_POOL_SIZE = 18
+MAX_CONTEXT_CHARS = 6500
 MAX_ANSWER_CHARS = 1200
+MIN_PAGE_TEXT_LEN = 20
 
-INJECTION_PATTERNS = [
+PII_PATTERNS = [
+    r"주민등록번호",
+    r"주민번호",
+    r"연봉",
+    r"급여",
+    r"월급",
+    r"계좌번호",
+    r"비밀번호",
+    r"password",
+    r"account number",
+    r"salary",
+    r"ssn",
+    r"social security",
+    r"personal information",
+]
+
+QUESTION_INJECTION_PATTERNS = [
+    r"APPROVED_BY_ADMIN",
+    r"반드시\s*.+\s*(적어라|써라|출력해라|출력하라|말해라)",
+    r"(무시|ignore).{0,16}(지시|명령|instruction|prompt)",
+    r"(이전|previous).{0,16}(지시|명령|instruction|prompt).{0,16}(무시|ignore)",
+    r"system\s*prompt",
+    r"developer\s*message",
+]
+
+CHUNK_INJECTION_PATTERNS = [
     "ignore previous instructions",
     "ignore all previous instructions",
     "system prompt",
@@ -66,19 +93,17 @@ INJECTION_PATTERNS = [
     "do not answer",
     "instead answer",
     "disregard previous",
-    "이전 지시를 무시",
-    "시스템 프롬프트",
-    "개발자 메시지",
-    "정답 대신",
-    "비밀번호",
-    "개인정보",
-    "민감정보",
-    "api 키",
     "verification token",
     "audit protocol",
     "begin directive",
     "end directive",
+    "이전 지시를 무시",
+    "시스템 프롬프트",
+    "개발자 메시지",
+    "정답 대신",
     "검증 토큰",
+    "개인정보",
+    "민감정보",
 ]
 
 SENSITIVE_OUTPUT_PATTERNS = {
@@ -109,16 +134,14 @@ SYSTEM_PROMPT = """You are a secure RAG assistant.
 - Include the exact answer keyword when possible.
 - Be concise and fact-focused.
 - If multiple documents are needed, combine the facts carefully.
-- If the answer is not in the context, answer exactly "정보 없음".
+- If the answer is not in the context or requests sensitive personal data, answer exactly "정보 없음".
 - If the question is in Korean, answer in Korean. Keep proper nouns and answer keywords in their original form.
 """
 
 
 def clean_text(text: str) -> str:
-    """PDF 텍스트에서 제어문자와 과도한 공백을 정리합니다."""
     if not text:
         return ""
-
     cleaned = text.replace("\x00", " ")
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = re.sub(r"[ \t\f\v]+", " ", cleaned)
@@ -128,16 +151,13 @@ def clean_text(text: str) -> str:
 
 
 def tokenize_for_search(text: str) -> list[str]:
-    """BM25/TF-IDF용 경량 토큰화."""
-    lowered = text.lower()
-    return re.findall(r"[a-z0-9]+|[가-힣]+", lowered)
+    return re.findall(r"[a-z0-9]+|[가-힣]+", text.lower())
 
 
 def extract_query_keywords(question: str) -> list[str]:
-    """질문에서 고유명사/숫자 위주의 키워드를 추출합니다."""
     candidates = re.findall(r"[A-Za-z][A-Za-z0-9_\-/.]*|\d[\d,./-]*|[가-힣]{2,}", question)
-    deduped = []
     seen = set()
+    deduped = []
     for token in candidates:
         lowered = token.lower()
         if lowered not in seen:
@@ -146,11 +166,30 @@ def extract_query_keywords(question: str) -> list[str]:
     return deduped
 
 
+def is_pii_request(question: str) -> bool:
+    return any(re.search(pattern, question, re.IGNORECASE) for pattern in PII_PATTERNS)
+
+
+def is_injection_question(question: str) -> bool:
+    return any(re.search(pattern, question, re.IGNORECASE) for pattern in QUESTION_INJECTION_PATTERNS)
+
+
+def sanitize_question(question: str) -> str:
+    sentences = re.split(r"(?<=[?？!！.])\s*", question)
+    safe_sentences = []
+    for sentence in sentences:
+        if not sentence.strip():
+            continue
+        if any(re.search(pattern, sentence, re.IGNORECASE) for pattern in QUESTION_INJECTION_PATTERNS):
+            continue
+        safe_sentences.append(sentence.strip())
+    return " ".join(safe_sentences).strip()
+
+
 def score_injection(text: str) -> int:
-    """악성 지시문 의심 점수를 계산합니다."""
     lowered = text.lower()
     score = 0
-    for pattern in INJECTION_PATTERNS:
+    for pattern in CHUNK_INJECTION_PATTERNS:
         if pattern.lower() in lowered:
             score += 2 if "ignore" in pattern.lower() or "시스템" in pattern else 1
     if re.search(r"\b(?:secret|password|token|key)\b", lowered):
@@ -165,30 +204,22 @@ def score_injection(text: str) -> int:
 
 
 def extract_pdf_pages(corpus_dir: str) -> list[dict]:
-    """코퍼스 폴더의 PDF들을 페이지 단위로 추출합니다."""
     if fitz is None:
         raise ImportError("PyMuPDF가 필요합니다. `pip install pymupdf` 후 다시 실행하세요.")
 
-    pages: list[dict] = []
     pdf_paths = sorted(Path(corpus_dir).glob("*.pdf"))
     print(f"  → PDF 수: {len(pdf_paths)}개")
+    pages: list[dict] = []
 
     for pdf_path in pdf_paths:
         doc_id = pdf_path.stem
         try:
             with fitz.open(pdf_path) as pdf:
                 for page_idx, page in enumerate(pdf, start=1):
-                    raw_text = page.get_text("text")
-                    cleaned = clean_text(raw_text)
+                    cleaned = clean_text(page.get_text("text"))
                     if len(cleaned) < MIN_PAGE_TEXT_LEN:
                         print(f"  [warn] {doc_id} p.{page_idx}: 텍스트가 너무 짧거나 비어 있습니다.")
-                    pages.append(
-                        {
-                            "doc_id": doc_id,
-                            "page": page_idx,
-                            "text": cleaned,
-                        }
-                    )
+                    pages.append({"doc_id": doc_id, "page": page_idx, "text": cleaned})
         except Exception as exc:
             print(f"  [warn] {pdf_path.name} 파싱 실패: {exc}")
 
@@ -196,7 +227,6 @@ def extract_pdf_pages(corpus_dir: str) -> list[dict]:
 
 
 def chunk_text(doc_id: str, page: int, text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[dict]:
-    """페이지 텍스트를 문자 기반 슬라이딩 윈도우로 청킹합니다."""
     if not text:
         return []
 
@@ -254,57 +284,30 @@ def _normalize_scores(scores: np.ndarray) -> np.ndarray:
     return (scores - min_score) / (max_score - min_score)
 
 
-def build_secure_prompt(question: str, context: str) -> str:
-    return (
-        "[Context]\n"
-        f"{context}\n\n"
-        "[Question]\n"
-        f"{question}\n\n"
-        "위 context의 사실만 사용해 짧고 명확하게 답하세요."
-    )
+def infer_question_complexity(question: str) -> int:
+    tagged = re.search(r"Level\s*(\d)", question, re.IGNORECASE)
+    if tagged:
+        return int(tagged.group(1))
+
+    lowered = question.lower()
+    if any(token in lowered for token in ["비율", "percentage", "ratio", "합계", "총", "difference", "차이", "계산", "calculate"]):
+        return 3
+    if any(token in lowered for token in ["속한", "소속", "whose", "which team", "based on", "팀장", "manager", "department head"]):
+        return 2
+    return 1
 
 
-def is_sensitive_output(answer: str) -> bool:
-    if not answer:
-        return False
-    for pattern in SENSITIVE_OUTPUT_PATTERNS.values():
-        if pattern.search(answer):
-            return True
-    return False
-
-
-def sanitize_answer(answer: str) -> str:
-    cleaned = clean_text(answer)
-    if not cleaned:
-        return "정보 없음"
-    if is_sensitive_output(cleaned):
-        return "정보 없음"
-    if len(cleaned) > MAX_ANSWER_CHARS:
-        cleaned = cleaned[:MAX_ANSWER_CHARS].rstrip()
-    return cleaned
-
-
-def append_failed_record(
-    tracker: UpstageTracker,
-    question_id: str,
-    token: str,
-    answer: str = "정보 없음",
-) -> None:
-    """LLM 호출이 완전히 실패했을 때도 CSV 형식을 유지하도록 레코드를 보강합니다."""
-    last_qid = tracker.records[-1]["question_id"] if tracker.records else None
-    if last_qid == question_id:
-        tracker.records[-1]["answer"] = sanitize_answer(answer)
-        return
-
-    tracker.records.append(
-        {
-            "question_id": question_id,
-            "answer": sanitize_answer(answer),
-            "used_tokens": 0,
-            "inference_time": 0.0,
-            "token": token,
-        }
-    )
+def build_followup_query(question: str, selected_chunks: list[dict]) -> str:
+    keywords = extract_query_keywords(question)
+    extra_terms = []
+    for chunk in selected_chunks[:2]:
+        text = chunk["text"]
+        for match in re.findall(r"[A-Z][A-Za-z0-9\-]{2,}|\d{4}|\d[\d,./-]*|[가-힣]{2,}", text):
+            if len(extra_terms) >= 6:
+                break
+            if match.lower() not in {token.lower() for token in keywords + extra_terms}:
+                extra_terms.append(match)
+    return " ".join([question, *keywords[:6], *extra_terms]).strip()
 
 
 def rerank_and_filter_chunks(
@@ -314,7 +317,6 @@ def rerank_and_filter_chunks(
     tfidf_scores: np.ndarray,
     top_k: int,
 ) -> list[dict]:
-    """후보 청크를 보안/관련성 기준으로 재정렬합니다."""
     if not candidates:
         return []
 
@@ -328,13 +330,13 @@ def rerank_and_filter_chunks(
         if keyword_set:
             keyword_overlap = len(keyword_set & chunk_tokens) / max(len(keyword_set), 1)
 
-        combined = (
+        score = (
             0.6 * float(bm25_scores[idx])
             + 0.35 * float(tfidf_scores[idx])
             + 0.2 * keyword_overlap
             - min(chunk["injection_score"] * 0.08, 0.4)
         )
-        reranked.append((combined, chunk))
+        reranked.append((score, chunk))
 
     reranked.sort(key=lambda item: item[0], reverse=True)
 
@@ -342,18 +344,110 @@ def rerank_and_filter_chunks(
     suspicious_chunks = [chunk for _, chunk in reranked if chunk["is_suspicious"]]
 
     selected: list[dict] = []
-    seen_chunk_ids = set()
-
+    seen = set()
     for pool in (safe_chunks, suspicious_chunks):
         for chunk in pool:
-            if chunk["chunk_id"] in seen_chunk_ids:
+            if chunk["chunk_id"] in seen:
                 continue
             selected.append(chunk)
-            seen_chunk_ids.add(chunk["chunk_id"])
+            seen.add(chunk["chunk_id"])
             if len(selected) >= top_k:
                 return selected
-
     return selected
+
+
+def select_chunks(question: str, index: dict, query_text: str, top_k: int) -> list[dict]:
+    chunks = index["chunks"]
+    if not chunks:
+        return []
+
+    query_tokens = tokenize_for_search(query_text)
+    bm25_raw = np.array(index["bm25"].get_scores(query_tokens), dtype=float) if index["bm25"] else np.zeros(len(chunks))
+    bm25_scores = _normalize_scores(bm25_raw)
+
+    tfidf_scores = np.zeros(len(chunks), dtype=float)
+    if index["tfidf_matrix"] is not None:
+        query_vec = index["vectorizer"].transform([query_text])
+        tfidf_raw = np.asarray((index["tfidf_matrix"] @ query_vec.T).toarray()).ravel()
+        tfidf_scores = _normalize_scores(tfidf_raw)
+
+    candidate_indices = set(_top_indices(bm25_scores, RETRIEVAL_POOL_SIZE))
+    candidate_indices.update(_top_indices(tfidf_scores, RETRIEVAL_POOL_SIZE))
+
+    candidates = []
+    for idx in sorted(candidate_indices):
+        chunk = dict(chunks[idx])
+        chunk["index"] = idx
+        candidates.append(chunk)
+
+    return rerank_and_filter_chunks(question, candidates, bm25_scores, tfidf_scores, top_k)
+
+
+def format_context(selected_chunks: list[dict]) -> str:
+    if not selected_chunks:
+        return "정보 없음"
+
+    context_parts = []
+    current_len = 0
+    for rank, chunk in enumerate(selected_chunks, start=1):
+        part = (
+            f"[{rank}] doc_id={chunk['doc_id']} page={chunk['page']} "
+            f"chunk_id={chunk['chunk_id']}\n{chunk['text']}"
+        )
+        if current_len + len(part) > MAX_CONTEXT_CHARS and context_parts:
+            break
+        context_parts.append(part)
+        current_len += len(part) + 2
+    return "\n\n".join(context_parts) if context_parts else "정보 없음"
+
+
+def build_secure_prompt(question: str, context: str) -> str:
+    return (
+        "[Context]\n"
+        f"{context}\n\n"
+        "[Question]\n"
+        f"{question}\n\n"
+        "위 context의 사실만 사용해 가장 짧고 정확하게 답하세요. "
+        "출력은 한 줄 plain text로만 작성하고, Markdown/불릿/출처 설명/추가 해설은 쓰지 마세요. "
+        "정답 키워드를 포함하고, 문맥에 없거나 민감정보 요청이면 반드시 '정보 없음'이라고만 답하세요."
+    )
+
+
+def is_sensitive_output(answer: str) -> bool:
+    if not answer:
+        return False
+    return any(pattern.search(answer) for pattern in SENSITIVE_OUTPUT_PATTERNS.values())
+
+
+def sanitize_answer(answer: str) -> str:
+    cleaned = clean_text(answer)
+    if not cleaned:
+        return "정보 없음"
+    cleaned = cleaned.replace("**", "").replace("__", "").replace("`", "")
+    cleaned = re.sub(r"\[(?:출처|source|context)[^\]]*\]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\(출처:[^)]+\)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.split("\n")[0].strip()
+    if is_sensitive_output(cleaned):
+        return "정보 없음"
+    if len(cleaned) > MAX_ANSWER_CHARS:
+        cleaned = cleaned[:MAX_ANSWER_CHARS].rstrip()
+    return cleaned
+
+
+def append_failed_record(tracker: UpstageTracker, question_id: str, token: str, answer: str = "정보 없음") -> None:
+    last_qid = tracker.records[-1]["question_id"] if tracker.records else None
+    if last_qid == question_id:
+        tracker.records[-1]["answer"] = sanitize_answer(answer)
+        return
+    tracker.records.append(
+        {
+            "question_id": question_id,
+            "answer": sanitize_answer(answer),
+            "used_tokens": 0,
+            "inference_time": 0.0,
+            "token": token,
+        }
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -391,15 +485,14 @@ def build_index(corpus_dir: str):
     )
     tfidf_matrix = vectorizer.fit_transform(corpus_texts) if corpus_texts else None
 
-    index = {
+    print("  인덱스 구축 완료\n")
+    return {
         "pages": pages,
         "chunks": chunks,
         "bm25": bm25,
         "vectorizer": vectorizer,
         "tfidf_matrix": tfidf_matrix,
     }
-    print("  인덱스 구축 완료\n")
-    return index
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -408,58 +501,30 @@ def build_index(corpus_dir: str):
 
 def retrieve(question: str, index, top_k: int = RETRIEVAL_TOP_K) -> str:
     """질문과 관련된 청크를 검색하여 컨텍스트 문자열로 반환합니다."""
-    chunks = index["chunks"]
-    if not chunks:
+    if is_pii_request(question):
         return "정보 없음"
 
-    query_keywords = extract_query_keywords(question)
-    expanded_query = " ".join([question, *query_keywords]).strip()
-    query_tokens = tokenize_for_search(expanded_query)
-
-    bm25 = index["bm25"]
-    bm25_raw = np.array(bm25.get_scores(query_tokens), dtype=float) if bm25 else np.zeros(len(chunks))
-    bm25_scores = _normalize_scores(bm25_raw)
-
-    tfidf_scores = np.zeros(len(chunks), dtype=float)
-    tfidf_matrix = index["tfidf_matrix"]
-    if tfidf_matrix is not None:
-        query_vec = index["vectorizer"].transform([expanded_query])
-        tfidf_raw = np.asarray((tfidf_matrix @ query_vec.T).toarray()).ravel()
-        tfidf_scores = _normalize_scores(tfidf_raw)
-
-    candidate_indices = set(_top_indices(bm25_scores, RETRIEVAL_POOL_SIZE))
-    candidate_indices.update(_top_indices(tfidf_scores, RETRIEVAL_POOL_SIZE))
-
-    candidates = []
-    for idx in sorted(candidate_indices):
-        chunk = dict(chunks[idx])
-        chunk["index"] = idx
-        candidates.append(chunk)
-
-    selected_chunks = rerank_and_filter_chunks(
-        question=question,
-        candidates=candidates,
-        bm25_scores=bm25_scores,
-        tfidf_scores=tfidf_scores,
-        top_k=top_k,
-    )
-
-    if not selected_chunks:
+    normalized_question = sanitize_question(question) if is_injection_question(question) else question
+    if not normalized_question:
         return "정보 없음"
 
-    context_parts = []
-    current_len = 0
-    for rank, chunk in enumerate(selected_chunks, start=1):
-        part = (
-            f"[{rank}] doc_id={chunk['doc_id']} page={chunk['page']} "
-            f"chunk_id={chunk['chunk_id']}\n{chunk['text']}"
-        )
-        if current_len + len(part) > MAX_CONTEXT_CHARS and context_parts:
-            break
-        context_parts.append(part)
-        current_len += len(part) + 2
+    base_query = " ".join([normalized_question, *extract_query_keywords(normalized_question)]).strip()
+    primary_chunks = select_chunks(normalized_question, index, base_query, top_k)
 
-    return "\n\n".join(context_parts) if context_parts else "정보 없음"
+    complexity = infer_question_complexity(normalized_question)
+    if complexity >= 3 and primary_chunks:
+        followup_query = build_followup_query(normalized_question, primary_chunks)
+        secondary_chunks = select_chunks(normalized_question, index, followup_query, max(top_k, 8))
+        merged = []
+        seen = set()
+        for chunk in primary_chunks + secondary_chunks:
+            if chunk["chunk_id"] in seen:
+                continue
+            merged.append(chunk)
+            seen.add(chunk["chunk_id"])
+        return format_context(merged[: max(top_k + 2, 8)])
+
+    return format_context(primary_chunks)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -474,7 +539,8 @@ def generate_answer(
     token: str,
 ) -> str:
     """컨텍스트와 질문을 받아 LLM 답변을 반환합니다."""
-    user_prompt = build_secure_prompt(question=question, context=context)
+    safe_question = sanitize_question(question) if is_injection_question(question) else question
+    user_prompt = build_secure_prompt(question=safe_question or question, context=context or "정보 없음")
     messages = [{"role": "user", "content": user_prompt}]
 
     try:
@@ -483,19 +549,21 @@ def generate_answer(
             messages=messages,
             token=token,
             system_prompt=SYSTEM_PROMPT,
-            temperature=0.1,
-            max_tokens=220,
+            model=GENERATION_MODEL,
+            temperature=0.0,
+            max_tokens=180,
         )
     except Exception as exc:
         print(f"  [warn] {question_id} 1차 생성 실패: {exc}")
-        short_context = context[:2500] if context and context != "정보 없음" else "정보 없음"
+        short_context = (context or "정보 없음")[:2500]
         answer = tracker.chat(
             question_id=question_id,
-            messages=[{"role": "user", "content": build_secure_prompt(question, short_context)}],
+            messages=[{"role": "user", "content": build_secure_prompt(safe_question or question, short_context)}],
             token=token,
             system_prompt=SYSTEM_PROMPT,
-            temperature=0.1,
-            max_tokens=180,
+            model=GENERATION_MODEL,
+            temperature=0.0,
+            max_tokens=140,
         )
 
     safe_answer = sanitize_answer(answer)
@@ -544,6 +612,7 @@ def run_pipeline(output_path: str = "submission.csv") -> None:
                 token=q["token"],
                 answer=answer,
             )
+
         print(f"  [{q['question_id']}] {answer[:60]}...")
 
     print()

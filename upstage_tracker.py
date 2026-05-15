@@ -24,7 +24,7 @@ import pandas as pd
 
 try:
     import certifi
-except ImportError:  # pragma: no cover - optional dependency guard
+except ImportError:  # pragma: no cover
     certifi = None
 
 
