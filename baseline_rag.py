@@ -80,6 +80,45 @@ def _embed_texts(texts: list[str], is_query: bool = False) -> list[list[float]]:
     return embeddings.tolist()
 
 
+def _linearize_markdown_table(text: str) -> str:
+    """마크다운 표를 'header: value | header: value' 형식의 자연어 행으로 변환합니다."""
+    lines = text.strip().splitlines()
+    output: list[str] = []
+    headers: list[str] = []
+    in_table = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            output.append(line)
+            in_table = False
+            headers = []
+            continue
+
+        cells = [c.strip() for c in stripped.split("|") if c.strip()]
+
+        # 구분선 (| --- | --- |) 건너뜀
+        if all(re.match(r"^-+$", c.replace(" ", "")) for c in cells):
+            continue
+
+        if not in_table:
+            headers = cells
+            in_table = True
+        else:
+            pairs = [f"{h}: {v}" for h, v in zip(headers, cells) if h and v]
+            output.append(" | ".join(pairs))
+
+    return "\n".join(output)
+
+
+def _text_for_model(chunk: dict) -> str:
+    """임베딩/reranking용 텍스트 반환. 표는 linearize, 일반 텍스트는 그대로."""
+    text = chunk["text"]
+    if chunk["metadata"].get("contains_table", False):
+        return _linearize_markdown_table(text)
+    return text
+
+
 def _build_embed_text(chunk: dict) -> str:
     meta = chunk["metadata"]
     parts = [f"source: {meta['source']}"]
@@ -87,7 +126,7 @@ def _build_embed_text(chunk: dict) -> str:
     if section and section != "ROOT":
         parts.append(f"section: {section}")
     prefix = "[" + " | ".join(parts) + "]\n"
-    return prefix + chunk["text"]
+    return prefix + _text_for_model(chunk)
 
 
 def _compress_chunk_solar(text: str, api_key: str) -> str | None:
@@ -670,7 +709,7 @@ def retrieve(question: str, index, top_k: int = 5) -> str:
     # ── Neural Reranking → top_k ──────────────────────────────────────────
     chunk_map = {c["metadata"]["chunk_id"]: c for c in chunks}
     reranker = _get_reranker()
-    pairs = [(question, chunk_map[cid]["text"]) for cid in rrf_top if cid in chunk_map]
+    pairs = [(question, _text_for_model(chunk_map[cid])) for cid in rrf_top if cid in chunk_map]
     scores = reranker.predict(pairs)
     ranked = sorted(zip(rrf_top, scores), key=lambda x: x[1], reverse=True)
     top_ids = [cid for cid, _ in ranked[:top_k]]
