@@ -6,6 +6,8 @@ pymupdf>=1.24.0              # PDF 파싱 (fitz)
 rank-bm25>=0.2.2             # BM25 keyword retrieval
 scikit-learn>=1.4.0,<1.7.0   # TF-IDF retrieval, 일부 Mac/conda 호환성 고려
 certifi>=2024.0.0            # macOS SSL 인증서 체인 안정화
+chromadb>=0.5.0              # persistent dense index
+sentence-transformers>=3.0.0 # BGE embedding + CrossEncoder reranking
 
 # ── 선택 패키지 (이번 MVP 기본 구현에서는 사용 안 함) ─────────────────────
 # pdfplumber>=0.11.0         # 대체 PDF parser

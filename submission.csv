@@ -1,6 +1,6 @@
 question_id,answer,used_tokens,inference_time,token
-Q_001,전략기획부,2576,1.188,dummy_token_q001
-Q_002,이서연,2925,1.063,dummy_token_q002
-Q_003,60%,3081,0.974,dummy_token_q003
-Q_061,2026년 3월 15일,2550,0.531,dummy_token_q061
-Q_081,정보 없음,275,1.384,dummy_token_q081
+Q_001,전략기획부,2576,0.427,dummy_token_q001
+Q_002,이서연,2925,0.762,dummy_token_q002
+Q_003,60%,3081,0.42,dummy_token_q003
+Q_061,2026년 3월 15일,2550,0.486,dummy_token_q061
+Q_081,정보 없음,275,0.408,dummy_token_q081

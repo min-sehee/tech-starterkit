@@ -17,12 +17,15 @@ $ python baseline_rag.py
 
 from __future__ import annotations
 
+import pickle
 import json
 import os
 import re
 import ssl
+import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -51,12 +54,31 @@ try:
 except ImportError:  # pragma: no cover
     TfidfVectorizer = None
 
+try:
+    import chromadb
+except ImportError:  # pragma: no cover
+    chromadb = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:  # pragma: no cover
+    SentenceTransformer = None
+
 
 CORPUS_DIR = "distribution/corpus"
 TEST_SUITE_PATH = "distribution/test_suite/Encrypted_Test_Suite.json"
 GENERATION_MODEL = "solar-pro"
 UPSTAGE_PARSE_URL = "https://api.upstage.ai/v1/document-ai/document-parse"
 CHUNKS_ARTIFACT_PATH = Path("artifacts/chunks.preview.jsonl")
+CHROMA_PERSIST_DIR = Path("artifacts/chroma")
+CHROMA_COLLECTION_NAME = "rag_index"
+COMPRESSED_CACHE_PATH = Path("artifacts/compressed_chunks.pkl")
+EMBED_BATCH_SIZE = 64
+EMBED_MODEL_NAME = "BAAI/bge-large-en-v1.5"
+BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+COMPRESS_MODEL = "solar-mini"
+SOLAR_CHAT_URL = "https://api.upstage.ai/v1/chat/completions"
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 220
 RETRIEVAL_TOP_K = 6
@@ -88,6 +110,7 @@ QUESTION_INJECTION_PATTERNS = [
     r"(이전|previous).{0,16}(지시|명령|instruction|prompt).{0,16}(무시|ignore)",
     r"system\s*prompt",
     r"developer\s*message",
+    r"approved_by_admin",
 ]
 
 CHUNK_INJECTION_PATTERNS = [
@@ -129,6 +152,7 @@ SENSITIVE_OUTPUT_PATTERNS = {
         r"\b(?:system prompt|developer message|ignore previous instructions)\b",
         re.IGNORECASE,
     ),
+    "approval_token": re.compile(r"\bAPPROVED_BY_ADMIN\b", re.IGNORECASE),
 }
 
 SYSTEM_PROMPT = """You are a secure RAG assistant.
@@ -149,6 +173,9 @@ SYSTEM_PROMPT = """You are a secure RAG assistant.
 - If the question is in Korean, answer in Korean. Keep proper nouns and answer keywords in their original form.
 """
 
+_embed_model = None
+_reranker = None
+
 
 def clean_text(text: str) -> str:
     if not text:
@@ -159,6 +186,50 @@ def clean_text(text: str) -> str:
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = re.sub(r" ?\n ?", "\n", cleaned)
     return cleaned.strip()
+
+
+def _get_embed_model():
+    global _embed_model
+    if SentenceTransformer is None:
+        raise ImportError("sentence-transformers가 필요합니다. `pip install sentence-transformers` 후 다시 실행하세요.")
+    if _embed_model is None:
+        print(f"  임베딩 모델 로딩: {EMBED_MODEL_NAME}")
+        _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    return _embed_model
+
+
+def _get_reranker():
+    global _reranker
+    if SentenceTransformer is None:
+        raise ImportError("sentence-transformers가 필요합니다. `pip install sentence-transformers` 후 다시 실행하세요.")
+    if _reranker is None:
+        from sentence_transformers import CrossEncoder
+
+        print(f"  Reranker 모델 로딩: {RERANKER_MODEL_NAME}")
+        _reranker = CrossEncoder(RERANKER_MODEL_NAME)
+    return _reranker
+
+
+def _embed_texts(texts: list[str], is_query: bool = False) -> list[list[float]]:
+    model = _get_embed_model()
+    model_inputs = [BGE_QUERY_PREFIX + text for text in texts] if is_query else texts
+    embeddings = model.encode(
+        model_inputs,
+        batch_size=EMBED_BATCH_SIZE,
+        show_progress_bar=len(texts) > 10,
+        normalize_embeddings=True,
+    )
+    return embeddings.tolist()
+
+
+def _build_embed_text(chunk: dict) -> str:
+    parts = [f"source: {chunk['doc_id']}"]
+    metadata = chunk.get("metadata", {})
+    section = metadata.get("section", "")
+    if section and section != "ROOT":
+        parts.append(f"section: {section}")
+    prefix = "[" + " | ".join(parts) + "]\n"
+    return prefix + chunk["text"]
 
 
 def tokenize_for_search(text: str) -> list[str]:
@@ -501,6 +572,60 @@ def _build_ssl_context():
     return ssl.create_default_context(cafile=certifi.where() if certifi is not None else None)
 
 
+def _compress_chunk_solar(text: str, api_key: str) -> str | None:
+    prompt = (
+        "Summarize the following document chunk in 2-3 sentences. "
+        "Preserve key entities, dates, numbers, titles, responsibilities, and decisions. "
+        "Remove filler and repetitive wording.\n\n"
+        f"{text}"
+    )
+    body = json.dumps(
+        {
+            "model": COMPRESS_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 200,
+            "temperature": 0,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url=SOLAR_CHAT_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, context=_build_ssl_context(), timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        return result["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return None
+
+
+def _batch_compress_chunks(chunks: list[dict], api_key: str) -> dict[str, str]:
+    def _compress_one(chunk: dict):
+        chunk_id = chunk["chunk_id"]
+        compressed = _compress_chunk_solar(chunk["text"], api_key)
+        return chunk_id, compressed if compressed else chunk["text"]
+
+    total = len(chunks)
+    compressed_map: dict[str, str] = {}
+    print(f"  청크 압축 중 (Solar {COMPRESS_MODEL}, {total}개)...")
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_compress_one, chunk): chunk for chunk in chunks}
+        done = 0
+        for future in as_completed(futures):
+            chunk_id, compressed_text = future.result()
+            compressed_map[chunk_id] = compressed_text
+            done += 1
+            if done % 20 == 0 or done == total:
+                print(f"    {done}/{total} 완료")
+    return compressed_map
+
+
 def _parse_pdf_with_upstage(pdf_path: Path, api_key: str) -> dict:
     boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
     with pdf_path.open("rb") as f:
@@ -532,12 +657,24 @@ def _parse_pdf_with_upstage(pdf_path: Path, api_key: str) -> dict:
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, context=_build_ssl_context(), timeout=180) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Upstage Parse API 오류 [{e.code}]: {detail}") from e
+    max_retries = 5
+    payload = None
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req, context=_build_ssl_context(), timeout=180) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < max_retries - 1:
+                wait = int(e.headers.get("Retry-After", 10 * (2 ** attempt)))
+                print(f"  429 rate limit — {wait}s 대기 후 재시도 ({attempt + 1}/{max_retries - 1})...")
+                time.sleep(wait)
+            else:
+                detail = e.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"Upstage Parse API 오류 [{e.code}]: {detail}") from e
+
+    if payload is None:
+        raise RuntimeError(f"문서 파싱 결과를 가져오지 못했습니다: {pdf_path.name}")
 
     pages = []
     for page in payload.get("pages", []):
@@ -558,6 +695,67 @@ def _parse_pdf_with_upstage(pdf_path: Path, api_key: str) -> dict:
         page_no = page["page"] if page["page"] > 0 else idx
         normalized_pages.append({"page": page_no, "markdown": _normalize_markdown(page["markdown"])})
     return {"source": pdf_path.name, "pages": normalized_pages}
+
+
+def _dense_cache_usable(corpus_dir: str) -> bool:
+    return _artifact_is_usable(corpus_dir) and CHROMA_PERSIST_DIR.exists()
+
+
+def _compressed_cache_usable(corpus_dir: str) -> bool:
+    return _artifact_is_usable(corpus_dir) and COMPRESSED_CACHE_PATH.exists()
+
+
+def _build_dense_index(chunks: list[dict]):
+    if chromadb is None or SentenceTransformer is None:
+        return None
+
+    texts = [_build_embed_text(chunk) for chunk in chunks]
+    embeddings = _embed_texts(texts)
+
+    print("  ChromaDB 저장 중...")
+    chroma_client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
+    try:
+        chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
+    except Exception:
+        pass
+    collection = chroma_client.create_collection(
+        CHROMA_COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
+    collection.add(
+        documents=texts,
+        embeddings=embeddings,
+        metadatas=[
+            {
+                "source": chunk["doc_id"],
+                "page": chunk["page"],
+                "section": chunk.get("metadata", {}).get("section", ""),
+                "contains_table": chunk.get("metadata", {}).get("contains_table", False),
+                "chunk_id": chunk["chunk_id"],
+            }
+            for chunk in chunks
+        ],
+        ids=[chunk["chunk_id"] for chunk in chunks],
+    )
+    return collection
+
+
+def _load_dense_index(chunks: list[dict]):
+    if chromadb is None or SentenceTransformer is None or not CHROMA_PERSIST_DIR.exists():
+        return None
+
+    chroma_client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
+    try:
+        collection = chroma_client.get_collection(CHROMA_COLLECTION_NAME)
+    except Exception:
+        return None
+
+    try:
+        if collection.count() != len(chunks):
+            return _build_dense_index(chunks)
+    except Exception:
+        return _build_dense_index(chunks)
+    return collection
 
 
 def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict]:
@@ -713,6 +911,7 @@ def rerank_and_filter_chunks(
     bm25_scores: np.ndarray,
     tfidf_scores: np.ndarray,
     top_k: int,
+    dense_rank_bonus: dict[int, float] | None = None,
 ) -> list[dict]:
     if not candidates:
         return []
@@ -733,6 +932,8 @@ def rerank_and_filter_chunks(
             + 0.2 * keyword_overlap
             - min(chunk["injection_score"] * 0.08, 0.4)
         )
+        if dense_rank_bonus:
+            score += dense_rank_bonus.get(idx, 0.0)
         reranked.append((score, chunk))
 
     reranked.sort(key=lambda item: item[0], reverse=True)
@@ -753,6 +954,23 @@ def rerank_and_filter_chunks(
     return selected
 
 
+def _neural_rerank(question: str, candidates: list[dict], compressed: dict[str, str], top_k: int) -> list[dict]:
+    if not candidates:
+        return []
+    reranker = _get_reranker()
+    pairs = []
+    for chunk in candidates:
+        rerank_text = compressed.get(chunk["chunk_id"]) or chunk["text"]
+        pairs.append((question, rerank_text))
+    scores = reranker.predict(pairs)
+    adjusted = []
+    for chunk, score in zip(candidates, scores):
+        penalty = 2.5 if chunk.get("is_suspicious") else 0.0
+        adjusted.append((chunk, float(score) - penalty))
+    ranked = sorted(adjusted, key=lambda item: item[1], reverse=True)
+    return [chunk for chunk, _ in ranked[:top_k]]
+
+
 def select_chunks(question: str, index: dict, query_text: str, top_k: int) -> list[dict]:
     chunks = index["chunks"]
     if not chunks:
@@ -771,13 +989,51 @@ def select_chunks(question: str, index: dict, query_text: str, top_k: int) -> li
     candidate_indices = set(_top_indices(bm25_scores, RETRIEVAL_POOL_SIZE))
     candidate_indices.update(_top_indices(tfidf_scores, RETRIEVAL_POOL_SIZE))
 
+    dense_rank_bonus: dict[int, float] = {}
+    dense_collection = index.get("dense_collection")
+    chunk_id_to_index = index.get("chunk_id_to_index", {})
+    if dense_collection is not None:
+        try:
+            query_embedding = _embed_texts([query_text], is_query=True)[0]
+            dense_result = dense_collection.query(
+                query_embeddings=[query_embedding],
+                n_results=RETRIEVAL_POOL_SIZE,
+                include=["distances"],
+            )
+            dense_ids = dense_result.get("ids", [[]])[0]
+            for rank, chunk_id in enumerate(dense_ids):
+                idx = chunk_id_to_index.get(chunk_id)
+                if idx is None:
+                    continue
+                candidate_indices.add(idx)
+                dense_rank_bonus[idx] = max(dense_rank_bonus.get(idx, 0.0), 0.25 / (rank + 1))
+        except Exception as exc:
+            print(f"  [warn] dense retrieval 실패, sparse-only로 계속 진행: {exc}")
+
     candidates = []
     for idx in sorted(candidate_indices):
         chunk = dict(chunks[idx])
         chunk["index"] = idx
         candidates.append(chunk)
 
-    return rerank_and_filter_chunks(question, candidates, bm25_scores, tfidf_scores, top_k)
+    pooled = rerank_and_filter_chunks(
+        question,
+        candidates,
+        bm25_scores,
+        tfidf_scores,
+        max(top_k * 3, 12),
+        dense_rank_bonus=dense_rank_bonus,
+    )
+
+    compressed = index.get("compressed", {})
+    dense_collection = index.get("dense_collection")
+    if dense_collection is not None and pooled:
+        try:
+            return _neural_rerank(question, pooled, compressed, top_k)
+        except Exception as exc:
+            print(f"  [warn] neural reranking 실패, heuristic ranking으로 계속 진행: {exc}")
+
+    return pooled[:top_k]
 
 
 def format_context(selected_chunks: list[dict]) -> str:
@@ -916,6 +1172,42 @@ def build_index(corpus_dir: str):
     )
     tfidf_matrix = vectorizer.fit_transform(corpus_texts) if corpus_texts else None
 
+    chunk_id_to_index = {chunk["chunk_id"]: idx for idx, chunk in enumerate(chunks)}
+    api_key = os.environ.get("UPSTAGE_API_KEY")
+
+    compressed = {}
+    if api_key:
+        if _compressed_cache_usable(corpus_dir):
+            print(f"  → 압축 캐시 로드: {COMPRESSED_CACHE_PATH}")
+            with COMPRESSED_CACHE_PATH.open("rb") as f:
+                compressed = pickle.load(f)
+        else:
+            try:
+                compressed = _batch_compress_chunks(chunks, api_key)
+                COMPRESSED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with COMPRESSED_CACHE_PATH.open("wb") as f:
+                    pickle.dump(compressed, f)
+                print(f"  → 압축 캐시 저장: {COMPRESSED_CACHE_PATH}")
+            except Exception as exc:
+                print(f"  [warn] chunk compression 실패: {exc}")
+                compressed = {}
+
+    dense_collection = None
+    dense_enabled = chromadb is not None and SentenceTransformer is not None
+    if dense_enabled:
+        try:
+            if _dense_cache_usable(corpus_dir):
+                print(f"  → dense index 로드: {CHROMA_PERSIST_DIR}")
+                dense_collection = _load_dense_index(chunks)
+            else:
+                dense_collection = _build_dense_index(chunks)
+                print(f"  → dense index 저장: {CHROMA_PERSIST_DIR}")
+        except Exception as exc:
+            print(f"  [warn] dense retrieval index 실패, sparse-only로 진행: {exc}")
+            dense_collection = None
+    else:
+        print("  [warn] chromadb 또는 sentence-transformers 미설치: sparse retrieval만 사용합니다.")
+
     print("  인덱스 구축 완료\n")
     return {
         "pages": pages,
@@ -923,6 +1215,9 @@ def build_index(corpus_dir: str):
         "bm25": bm25,
         "vectorizer": vectorizer,
         "tfidf_matrix": tfidf_matrix,
+        "chunk_id_to_index": chunk_id_to_index,
+        "compressed": compressed,
+        "dense_collection": dense_collection,
     }
 
 

@@ -362,3 +362,210 @@ artifact 로딩은 아래 규칙으로 구현했습니다.
 - artifact를 통해 반복 실행 속도를 개선할 수 있음
 
 정리하면, 이 부분은 “성능 향상 시도”와 “실패 내성”을 같이 확보하기 위해 넣은 변경입니다.
+
+## 추가 구현 메모: embedding 브랜치 반영 사항
+
+아래 내용은 `origin/embedding` 브랜치에서 참고해 반영한 기능들에 대한 구현 메모입니다.  
+기존 설명은 그대로 두고, 이번 단계에서 추가된 dense retrieval 관련 변경만 따로 정리합니다.
+
+### 1. 이번에 추가로 반영한 기능
+
+이번 단계에서는 “무거운 기능도 포함해서 다 반영” 요청에 맞춰 아래 기능을 코드에 넣었습니다.
+
+- `SentenceTransformer` 기반 dense embedding retrieval
+- `ChromaDB` persistent vector index
+- `CrossEncoder` 기반 neural reranking
+- `Solar mini`를 활용한 chunk compression
+- compression cache 재사용
+- Parse API 429 재시도 로직
+
+즉, 이전에는 주로 `BM25 + TF-IDF` 중심이던 검색 파이프라인에 dense retrieval 계층을 더 추가한 것입니다.
+
+### 2. 이번에 수정한 파일
+
+이 단계에서 직접 수정한 파일은 아래입니다.
+
+- [baseline_rag.py](/Users/hanjisu/tech-starterkit/baseline_rag.py)
+- [requirements.txt](/Users/hanjisu/tech-starterkit/requirements.txt)
+- [README2.md](/Users/hanjisu/tech-starterkit/README2.md)
+
+실행 중 새로 사용/생성되는 artifact는 아래입니다.
+
+- [artifacts/chunks.preview.jsonl](/Users/hanjisu/tech-starterkit/artifacts/chunks.preview.jsonl)
+- [artifacts/compressed_chunks.pkl](/Users/hanjisu/tech-starterkit/artifacts/compressed_chunks.pkl)
+- `artifacts/chroma/` 디렉토리 (Chroma persistent index)
+- [submission.csv](/Users/hanjisu/tech-starterkit/submission.csv)
+
+### 3. baseline_rag.py에서 추가한 핵심 요소
+
+#### 3-1. Dense embedding 모델 로더
+
+아래 모델을 사용하도록 구현했습니다.
+
+- embedding model: `BAAI/bge-large-en-v1.5`
+- reranker model: `cross-encoder/ms-marco-MiniLM-L-6-v2`
+
+질문 임베딩 시에는 BGE 권장 prefix를 붙이도록 했습니다.
+
+- `Represent this sentence for searching relevant passages: `
+
+이 부분은 `embedding` 브랜치의 아이디어를 그대로 가져온 핵심입니다.
+
+#### 3-2. ChromaDB persistent index
+
+dense retrieval 결과를 매 실행마다 새로 만들지 않도록 persistent Chroma index를 사용합니다.
+
+경로:
+
+- `artifacts/chroma`
+
+동작 방식:
+
+1. dense 패키지가 설치돼 있으면
+2. chunk text를 embedding으로 변환하고
+3. Chroma collection에 저장
+4. 다음 실행에서는 같은 chunk 수/같은 artifact 기준이면 그대로 로드
+
+즉, 첫 실행은 무겁지만 이후에는 dense index를 재사용할 수 있게 했습니다.
+
+#### 3-3. Solar mini chunk compression
+
+각 chunk를 그대로 reranker에 넣으면 길고 불필요한 문장이 많을 수 있어서, `solar-mini`로 chunk를 2~3문장 정도로 압축하는 기능을 넣었습니다.
+
+압축 목적:
+
+- 핵심 entity, 날짜, 숫자, 책임자, 결정사항 보존
+- 군더더기 문장 제거
+- reranker와 최종 retrieval 품질 개선
+
+압축 결과는 아래 파일에 캐시합니다.
+
+- `artifacts/compressed_chunks.pkl`
+
+즉, 한 번 압축한 뒤에는 다시 매번 Solar mini를 호출하지 않습니다.
+
+### 4. 검색 파이프라인이 어떻게 바뀌었는가
+
+기존:
+
+- BM25
+- TF-IDF
+- heuristic rerank
+
+현재:
+
+1. BM25 top candidates
+2. TF-IDF top candidates
+3. Dense retrieval top candidates (Chroma + BGE embedding)
+4. 세 후보군 합치기
+5. heuristic rerank
+6. `CrossEncoder` neural rerank
+7. 최종 top-k context 구성
+
+즉, 지금은 sparse retrieval과 dense retrieval이 동시에 들어가는 하이브리드 구조입니다.
+
+### 5. reranker 반영 방식
+
+`CrossEncoder`는 dense retrieval과 sparse retrieval이 뽑아온 후보 청크들 중에서 실제 질문과 더 잘 맞는 청크를 다시 순서 조정하는 역할을 합니다.
+
+구현 방식:
+
+- candidate pool을 먼저 넉넉하게 확보
+- 각 chunk에 대해 `(question, rerank_text)` pair 생성
+- `reranker.predict()`로 relevance score 계산
+- score 순으로 정렬해 최종 top-k 선택
+
+여기서 rerank 입력은 가능하면 compression cache 결과를 우선 사용합니다.
+
+### 6. 보안 이슈와 추가 보정
+
+dense retrieval을 넣으면 성능이 좋아질 수도 있지만, 오히려 suspicious chunk가 다시 상위로 올라오는 부작용이 생길 수 있습니다.
+
+실제로 더미 질문 테스트 중 `Q_003`에서 prompt injection 계열 텍스트인 `APPROVED_BY_ADMIN`이 답변에 섞이는 회귀가 발생했습니다.
+
+그래서 추가로 아래 보정을 넣었습니다.
+
+- suspicious chunk는 neural rerank score에서 강한 penalty 적용
+- `APPROVED_BY_ADMIN`을 질문/출력 보안 패턴에 추가
+- output sanitization으로 누출성 토큰 차단 강화
+
+즉, dense retrieval 성능을 넣되 보안 회귀를 막기 위한 보정까지 같이 반영한 상태입니다.
+
+### 7. requirements.txt에서 추가된 패키지
+
+이번 단계에서 `requirements.txt`에 사실상 dense retrieval용 패키지가 추가됐습니다.
+
+- `chromadb`
+- `sentence-transformers`
+
+의미는 다음과 같습니다.
+
+- `chromadb`: persistent vector DB
+- `sentence-transformers`: BGE embedding + CrossEncoder reranker
+
+기존 패키지인 `rank-bm25`, `scikit-learn`, `pymupdf`, `certifi` 등은 그대로 유지됩니다.
+
+### 8. 실제 설치 및 실행에서 확인한 내용
+
+실제로 아래 명령으로 패키지를 설치했습니다.
+
+```bash
+python -m pip install chromadb sentence-transformers
+```
+
+이후 확인된 상태:
+
+- `chromadb OK`
+- `sentence_transformers OK`
+
+실행 로그에서 확인된 사항:
+
+- `임베딩 모델 로딩: BAAI/bge-large-en-v1.5`
+- `ChromaDB 저장 중...`
+- `→ dense index 저장: artifacts/chroma`
+- `Reranker 모델 로딩: cross-encoder/ms-marco-MiniLM-L-6-v2`
+
+즉, dense retrieval 경로가 실제로 활성화되는 것까지 확인했습니다.
+
+### 9. 현재 dense retrieval 동작 상태
+
+현재 코드 상태는 아래와 같습니다.
+
+- heavy deps가 없으면:
+  - BM25 + TF-IDF + compression cache 중심
+- heavy deps가 있으면:
+  - BM25 + TF-IDF + dense retrieval + neural reranking
+
+즉, 코드는 무거운 경로를 지원하지만, 환경이 가벼우면 자동으로 sparse-only 폴백도 가능합니다.
+
+### 10. 현재 확인된 한계
+
+dense retrieval을 켠 상태에서 보안 회귀를 막기 위해 suspicious chunk 패널티를 강하게 주었고, 그 결과 더미 질문 기준으로 일부 추론형 질문(`Q_003`)은 다시 `정보 없음`으로 나올 수 있었습니다.
+
+즉:
+
+- dense retrieval 자체는 정상 동작함
+- 하지만 retrieval recall, reranking, injection penalty 사이의 균형 튜닝은 아직 더 손볼 여지가 있음
+
+이 부분은 최고 점수용 정교화 단계에서 추가 튜닝 포인트로 볼 수 있습니다.
+
+### 11. 요약
+
+이번 단계에서 반영한 embedding 브랜치 요소는 아래로 요약할 수 있습니다.
+
+- Document Parse / artifact 기반 인덱싱 위에
+- dense embedding retrieval 계층을 추가하고
+- Chroma persistent cache를 붙이고
+- CrossEncoder reranker를 넣고
+- Solar mini 압축 캐시까지 붙인 상태
+
+즉, 현재 파이프라인은 단순 baseline을 넘어:
+
+- sparse retrieval
+- dense retrieval
+- reranking
+- chunk compression
+- artifact cache
+- 보안 필터
+
+를 모두 가진 확장형 구조로 발전한 상태입니다.
