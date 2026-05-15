@@ -44,8 +44,10 @@ BGE_QUERY_PREFIX   = "Represent this sentence for searching relevant passages: "
 COMPRESSED_CACHE_PATH = ".index_compressed.pkl"
 SOLAR_CHAT_URL        = "https://api.upstage.ai/v1/chat/completions"
 COMPRESS_MODEL        = "solar-mini"
+RERANKER_MODEL_NAME   = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 _embed_model: "SentenceTransformer | None" = None
+_reranker = None
 
 
 def _get_embed_model() -> SentenceTransformer:
@@ -54,6 +56,15 @@ def _get_embed_model() -> SentenceTransformer:
         print(f"  임베딩 모델 로딩: {EMBED_MODEL_NAME}")
         _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
     return _embed_model
+
+
+def _get_reranker():
+    from sentence_transformers import CrossEncoder
+    global _reranker
+    if _reranker is None:
+        print(f"  Reranker 모델 로딩: {RERANKER_MODEL_NAME}")
+        _reranker = CrossEncoder(RERANKER_MODEL_NAME)
+    return _reranker
 
 
 def _embed_texts(texts: list[str], is_query: bool = False) -> list[list[float]]:
@@ -629,15 +640,15 @@ def retrieve(question: str, index, top_k: int = 5) -> str:
     collection = index["collection"]
     compressed = index.get("compressed", {})
 
-    candidate_n = 20
+    candidate_n = 25
     k_rrf = 60
 
-    # ── BM25 top-20 ──────────────────────────────────────────────────────
+    # ── BM25 top-25 ──────────────────────────────────────────────────────
     tokens = question.split()
     bm25_scores = bm25.get_scores(tokens)
     bm25_ranked = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:candidate_n]
 
-    # ── Dense top-20 ─────────────────────────────────────────────────────
+    # ── Dense top-25 ─────────────────────────────────────────────────────
     q_emb = _embed_texts([question], is_query=True)[0]
     dense_res = collection.query(
         query_embeddings=[q_emb],
@@ -646,7 +657,7 @@ def retrieve(question: str, index, top_k: int = 5) -> str:
     )
     dense_ids = dense_res["ids"][0]
 
-    # ── RRF 합산 ─────────────────────────────────────────────────────────
+    # ── RRF 합산 → top-25 ────────────────────────────────────────────────
     rrf: dict[str, float] = {}
     for rank, idx in enumerate(bm25_ranked):
         cid = chunks[idx]["metadata"]["chunk_id"]
@@ -654,10 +665,17 @@ def retrieve(question: str, index, top_k: int = 5) -> str:
     for rank, cid in enumerate(dense_ids):
         rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (k_rrf + rank + 1)
 
-    top_ids = sorted(rrf, key=rrf.__getitem__, reverse=True)[:top_k]
+    rrf_top = sorted(rrf, key=rrf.__getitem__, reverse=True)[:candidate_n]
+
+    # ── Neural Reranking → top_k ──────────────────────────────────────────
+    chunk_map = {c["metadata"]["chunk_id"]: c for c in chunks}
+    reranker = _get_reranker()
+    pairs = [(question, chunk_map[cid]["text"]) for cid in rrf_top if cid in chunk_map]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(rrf_top, scores), key=lambda x: x[1], reverse=True)
+    top_ids = [cid for cid, _ in ranked[:top_k]]
 
     # ── 컨텍스트 조립 (압축본 우선, 없으면 원본) ─────────────────────────
-    chunk_map = {c["metadata"]["chunk_id"]: c for c in chunks}
     parts = []
     for cid in top_ids:
         text = compressed.get(cid) or (chunk_map[cid]["text"] if cid in chunk_map else "")
@@ -723,9 +741,11 @@ def generate_answer(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def run_pipeline(output_path: str = "submission.csv") -> None:
-    # Phase 1: 인덱스 구축 (1회)
+    # Phase 1: 인덱스 구축 + 모델 사전 로드 (1회)
     print("[1/3] 인덱스 구축 중...")
     index = build_index(CORPUS_DIR)
+    _get_embed_model()
+    _get_reranker()
 
     # 질문 로드
     print("[2/3] 질문 로드 중...")
