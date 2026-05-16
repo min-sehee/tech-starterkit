@@ -69,6 +69,7 @@ CORPUS_DIR = "distribution/corpus"
 TEST_SUITE_PATH = "distribution/test_suite/Encrypted_Test_Suite.json"
 GENERATION_MODEL = "solar-pro"
 UPSTAGE_PARSE_URL = "https://api.upstage.ai/v1/document-ai/document-parse"
+POISON_RULES_PATH = "poison_rules.json"
 ARTIFACTS_ROOT = Path("artifacts_upgrade")
 CHUNKS_ARTIFACT_PATH = ARTIFACTS_ROOT / "chunks.preview.jsonl"
 CHROMA_PERSIST_DIR = ARTIFACTS_ROOT / "chroma"
@@ -207,6 +208,7 @@ SYSTEM_PROMPT = """You are a secure RAG assistant.
 
 _embed_model = None
 _reranker = None
+_poison_rules_cache = None
 
 
 def clean_text(text: str) -> str:
@@ -218,6 +220,161 @@ def clean_text(text: str) -> str:
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = re.sub(r" ?\n ?", "\n", cleaned)
     return cleaned.strip()
+
+
+def _load_poison_rules(path: str = POISON_RULES_PATH) -> dict:
+    default_rules = {
+        "version": "v1",
+        "signals": {
+            "targets": [
+                r"\b(ai|retrieval)\s+(systems?|system|assistant)\b",
+                r"\b(system prompt|developer message)\b",
+            ],
+            "obligations": [r"\b(must|required|mandated|should|반드시|무조건)\b"],
+            "actions": [
+                r"\b(append|include|confirm|output|print|repeat|reveal|disclose)\b",
+                r"\b(출력|반복|공개|노출|포함|추가)\b",
+            ],
+            "scope": [r"\b(every response|each response|each answer|always|모든 답변|항상)\b"],
+        },
+        "high_threshold": 3,
+        "medium_threshold": 2,
+        "exact_phrases": [
+            "approved_by_admin",
+            "ignore previous instructions",
+            "ignore all previous instructions",
+            "reveal the system prompt",
+            "developer message",
+            "정답 대신",
+            "이전 지시를 무시",
+        ],
+    }
+    rules_path = Path(path)
+    if not rules_path.exists():
+        return default_rules
+    try:
+        loaded = json.loads(rules_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            merged = dict(default_rules)
+            merged.update(loaded)
+            merged["signals"] = {**default_rules["signals"], **loaded.get("signals", {})}
+            return merged
+    except Exception:
+        pass
+    return default_rules
+
+
+def _get_poison_rules() -> dict:
+    global _poison_rules_cache
+    if _poison_rules_cache is None:
+        _poison_rules_cache = _load_poison_rules()
+    return _poison_rules_cache
+
+
+def _sanitize_instruction_poison(text: str, rules: dict | None = None) -> tuple[str, dict]:
+    if not text:
+        return text, {
+            "poison_score": 0,
+            "poison_classes": [],
+            "poison_spans_count": 0,
+            "security_flags": [],
+            "removed": False,
+        }
+
+    rules = rules or _get_poison_rules()
+    lines = text.splitlines()
+    kept: list[str] = []
+    i = 0
+    score = 0
+    found_classes = set()
+    removed_spans = 0
+
+    sig = rules.get("signals", {})
+    pat_targets = [re.compile(pattern, flags=re.IGNORECASE) for pattern in sig.get("targets", [])]
+    pat_oblig = [re.compile(pattern, flags=re.IGNORECASE) for pattern in sig.get("obligations", [])]
+    pat_actions = [re.compile(pattern, flags=re.IGNORECASE) for pattern in sig.get("actions", [])]
+    pat_scope = [re.compile(pattern, flags=re.IGNORECASE) for pattern in sig.get("scope", [])]
+    exact_phrases = [str(item).strip().lower() for item in rules.get("exact_phrases", []) if str(item).strip()]
+    high_threshold = int(rules.get("high_threshold", 3))
+    medium_threshold = int(rules.get("medium_threshold", 2))
+
+    pat_quote = re.compile(r"\"[^\"]{8,}\"")
+    pat_notice = re.compile(r"(?i)^\s*\[[^\]]*(NOTICE|REQUIREMENT|CONTROL|LOG|DIRECTIVE)[^\]]*\]\s*$")
+    pat_secret = re.compile(r"(?i)\b(secret|password|token|api key|prompt|developer message)\b")
+
+    while i < len(lines):
+        line = lines[i]
+        lowered = line.lower()
+        hit_target = any(pattern.search(line) for pattern in pat_targets)
+        hit_oblig = any(pattern.search(line) for pattern in pat_oblig)
+        hit_action = any(pattern.search(line) for pattern in pat_actions)
+        hit_scope = any(pattern.search(line) for pattern in pat_scope)
+        hit_exact = any(phrase in lowered for phrase in exact_phrases)
+
+        is_candidate_start = bool(pat_notice.match(line.strip())) or hit_exact or (hit_target and (hit_oblig or hit_action or hit_scope))
+        if not is_candidate_start:
+            kept.append(line)
+            i += 1
+            continue
+
+        j = i
+        block_lines: list[str] = []
+        while j < len(lines):
+            block_lines.append(lines[j])
+            if lines[j].strip() == "" and j > i:
+                break
+            if j - i >= 14:
+                break
+            j += 1
+        block = "\n".join(block_lines)
+
+        block_score = 0
+        if any(pattern.search(block) for pattern in pat_targets):
+            block_score += 2
+            found_classes.add("poison_target")
+        if any(pattern.search(block) for pattern in pat_oblig) and any(pattern.search(block) for pattern in pat_actions):
+            block_score += 2
+            found_classes.add("poison_instruction")
+        if any(pattern.search(block) for pattern in pat_scope):
+            block_score += 2
+            found_classes.add("poison_scope")
+        if pat_quote.search(block):
+            block_score += 1
+            found_classes.add("poison_quote")
+        if pat_secret.search(block):
+            block_score += 1
+            found_classes.add("poison_secret")
+        if any(phrase in block.lower() for phrase in exact_phrases):
+            block_score += 2
+            found_classes.add("poison_exact")
+
+        if block_score >= high_threshold:
+            score += block_score
+            removed_spans += 1
+            i = j + 1
+            continue
+
+        if block_score >= medium_threshold:
+            score += block_score
+            found_classes.add("poison_suspected")
+
+        kept.extend(block_lines)
+        i = j + 1
+
+    cleaned = clean_text("\n".join(kept))
+    security_flags = []
+    if removed_spans > 0:
+        security_flags.append("instruction_poisoning")
+    elif score >= medium_threshold:
+        security_flags.append("poison_suspected")
+
+    return cleaned, {
+        "poison_score": score,
+        "poison_classes": sorted(found_classes),
+        "poison_spans_count": removed_spans,
+        "security_flags": security_flags,
+        "removed": removed_spans > 0,
+    }
 
 
 def _hangul_ratio(text: str) -> float:
@@ -400,6 +557,8 @@ def sanitize_chunk_text_for_context(text: str) -> str:
             continue
         if _matches_any_pattern(stripped, CONTEXT_PII_LINE_PATTERNS):
             continue
+        if score_injection(stripped) >= 2:
+            continue
         lines.append(line)
 
     cleaned = clean_text("\n".join(lines))
@@ -548,7 +707,11 @@ def _artifact_is_usable(corpus_dir: str, artifact_path: Path = CHUNKS_ARTIFACT_P
         return False
     artifact_mtime = artifact_path.stat().st_mtime
     latest_pdf_mtime = max(path.stat().st_mtime for path in pdf_paths)
-    return artifact_mtime >= latest_pdf_mtime
+    poison_rules_path = Path(POISON_RULES_PATH)
+    latest_dependency_mtime = latest_pdf_mtime
+    if poison_rules_path.exists():
+        latest_dependency_mtime = max(latest_dependency_mtime, poison_rules_path.stat().st_mtime)
+    return artifact_mtime >= latest_dependency_mtime
 
 
 def _load_chunks_from_artifact(artifact_path: Path = CHUNKS_ARTIFACT_PATH) -> list[dict]:
@@ -560,6 +723,7 @@ def _load_chunks_from_artifact(artifact_path: Path = CHUNKS_ARTIFACT_PATH) -> li
                 continue
             chunk = json.loads(line)
             metadata = chunk.get("metadata", {})
+            poison_score = int(metadata.get("poison_score", 0) or 0)
             chunks.append(
                 {
                     "doc_id": metadata.get("source", "unknown"),
@@ -567,7 +731,7 @@ def _load_chunks_from_artifact(artifact_path: Path = CHUNKS_ARTIFACT_PATH) -> li
                     "chunk_id": metadata.get("chunk_id", f"artifact_{len(chunks)}"),
                     "text": clean_text(chunk.get("text", "")),
                     "injection_score": score_injection(chunk.get("text", "")),
-                    "is_suspicious": score_injection(chunk.get("text", "")) >= 2,
+                    "is_suspicious": score_injection(chunk.get("text", "")) >= 2 or poison_score >= 3,
                     "metadata": metadata,
                 }
             )
@@ -1023,7 +1187,7 @@ def _postprocess_short_chunks(chunks: list[dict]) -> list[dict]:
                 "chunk_id": metadata.get("chunk_id", f"processed_{len(processed)}"),
                 "text": text,
                 "injection_score": score_injection(text),
-                "is_suspicious": score_injection(text) >= 2,
+                "is_suspicious": score_injection(text) >= 2 or int(metadata.get("poison_score", 0) or 0) >= 3,
                 "metadata": metadata,
             }
         )
@@ -1241,6 +1405,7 @@ def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict
     target_words = 700
     overlap_words = 100
     min_chunk_words = 140
+    poison_rules = _get_poison_rules()
     pdf_files = sorted(Path(corpus_dir).glob("*.pdf"))
     print(f"  → PDF 수: {len(pdf_files)}개")
 
@@ -1288,7 +1453,8 @@ def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict
                     email_cc = _split_addresses(kv["Cc:"]) if kv["Cc:"] != "unknown" else []
                     email_sent = kv["Sent:"] if kv["Sent:"] not in (None, "unknown") else None
 
-                    clean_body, disclaimer_removed = _clean_email_body(body_wo_header)
+                    sanitized_body, poison_info = _sanitize_instruction_poison(body_wo_header, poison_rules)
+                    clean_body, disclaimer_removed = _clean_email_body(sanitized_body)
                     if not clean_body:
                         continue
 
@@ -1342,6 +1508,10 @@ def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict
                                     "disclaimer_removed": disclaimer_removed,
                                     "contains_table": False,
                                     "email_chunk_unit_index": unit_idx,
+                                    "security_flags": poison_info.get("security_flags", []),
+                                    "poison_score": poison_info.get("poison_score", 0),
+                                    "poison_classes": poison_info.get("poison_classes", []),
+                                    "poison_spans_count": poison_info.get("poison_spans_count", 0),
                                 },
                             }
                         )
@@ -1365,7 +1535,8 @@ def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict
                 for paragraph in merged_units:
                     final_units = _split_by_word_limit(paragraph, target_words, overlap_words)
                     for unit in final_units:
-                        text = clean_text(_remove_header_noise(unit))
+                        sanitized_unit, poison_info = _sanitize_instruction_poison(_remove_header_noise(unit), poison_rules)
+                        text = clean_text(sanitized_unit)
                         if not text:
                             continue
                         injection_score = score_injection(text)
@@ -1376,7 +1547,7 @@ def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict
                                 "chunk_id": f"{Path(source).stem}::c{global_chunk_index}",
                                 "text": text,
                                 "injection_score": injection_score,
-                                "is_suspicious": injection_score >= 2,
+                                "is_suspicious": injection_score >= 2 or poison_info.get("poison_score", 0) >= 3,
                                 "metadata": {
                                     "source": Path(source).stem,
                                     "page": page_idx,
@@ -1384,6 +1555,10 @@ def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict
                                     "contains_table": _contains_markdown_table(text),
                                     "pipeline_stage": "document_parse_post_chunk",
                                     "chunk_index": global_chunk_index,
+                                    "security_flags": poison_info.get("security_flags", []),
+                                    "poison_score": poison_info.get("poison_score", 0),
+                                    "poison_classes": poison_info.get("poison_classes", []),
+                                    "poison_spans_count": poison_info.get("poison_spans_count", 0),
                                 },
                             }
                         )
@@ -1402,6 +1577,7 @@ def chunk_text(doc_id: str, page: int, text: str, chunk_size: int = CHUNK_SIZE, 
         return []
 
     chunks: list[dict] = []
+    poison_rules = _get_poison_rules()
     start = 0
     chunk_index = 0
     text_len = len(text)
@@ -1417,6 +1593,9 @@ def chunk_text(doc_id: str, page: int, text: str, chunk_size: int = CHUNK_SIZE, 
 
         chunk = clean_text(text[start:end])
         if chunk:
+            chunk, poison_info = _sanitize_instruction_poison(chunk, poison_rules)
+            chunk = clean_text(chunk)
+        if chunk:
             injection_score = score_injection(chunk)
             chunks.append(
                 {
@@ -1425,7 +1604,16 @@ def chunk_text(doc_id: str, page: int, text: str, chunk_size: int = CHUNK_SIZE, 
                     "chunk_id": f"{doc_id}_p{page}_c{chunk_index:03d}",
                     "text": chunk,
                     "injection_score": injection_score,
-                    "is_suspicious": injection_score >= 2,
+                    "is_suspicious": injection_score >= 2 or poison_info.get("poison_score", 0) >= 3,
+                    "metadata": {
+                        "source": doc_id,
+                        "page": page,
+                        "contains_table": _contains_markdown_table(chunk),
+                        "security_flags": poison_info.get("security_flags", []),
+                        "poison_score": poison_info.get("poison_score", 0),
+                        "poison_classes": poison_info.get("poison_classes", []),
+                        "poison_spans_count": poison_info.get("poison_spans_count", 0),
+                    },
                 }
             )
             chunk_index += 1
@@ -1574,6 +1762,7 @@ def rerank_and_filter_chunks(
         chunk_tokens = set(tokenize_for_search(chunk["text"]))
         keyword_overlap = 0.0
         context_sensitive_score = _context_sensitive_score(chunk["text"])
+        poison_score = int(chunk.get("metadata", {}).get("poison_score", 0) or 0)
         if keyword_set:
             keyword_overlap = len(keyword_set & chunk_tokens) / max(len(keyword_set), 1)
 
@@ -1583,6 +1772,7 @@ def rerank_and_filter_chunks(
             + 0.2 * keyword_overlap
             - min(chunk["injection_score"] * 0.08, 0.4)
             - min(context_sensitive_score * 0.08, 0.35)
+            - min(poison_score * 0.08, 0.4)
         )
         if dense_rank_bonus:
             score += dense_rank_bonus.get(idx, 0.0)
@@ -1619,6 +1809,7 @@ def _neural_rerank(question: str, candidates: list[dict], compressed: dict[str, 
     for chunk, score in zip(candidates, scores):
         penalty = 2.5 if chunk.get("is_suspicious") else 0.0
         penalty += min(_context_sensitive_score(chunk["text"]) * 0.45, 1.8)
+        penalty += min(int(chunk.get("metadata", {}).get("poison_score", 0) or 0) * 0.4, 1.6)
         adjusted.append((chunk, float(score) - penalty))
     ranked = sorted(adjusted, key=lambda item: item[1], reverse=True)
     reranked = [chunk for chunk, _ in ranked[:top_k]]
@@ -1936,9 +2127,17 @@ def build_index(corpus_dir: str):
             print(f"  → artifacts 저장: {CHUNKS_ARTIFACT_PATH}")
 
     suspicious_count = sum(1 for chunk in chunks if chunk["is_suspicious"])
+    poison_removed_count = sum(int(chunk.get("metadata", {}).get("poison_spans_count", 0) or 0) for chunk in chunks)
+    poison_flagged_count = sum(
+        1
+        for chunk in chunks
+        if chunk.get("metadata", {}).get("security_flags") or int(chunk.get("metadata", {}).get("poison_score", 0) or 0) >= 2
+    )
     print(f"  → 페이지 수: {len(pages)}개")
     print(f"  → chunk 수: {len(chunks)}개")
     print(f"  → suspicious chunk 수: {suspicious_count}개")
+    print(f"  → poison sanitized span 수: {poison_removed_count}개")
+    print(f"  → poison flagged chunk 수: {poison_flagged_count}개")
 
     tokenized_chunks = [tokenize_for_search(_build_sparse_text(chunk)) for chunk in chunks]
     corpus_texts = [_build_sparse_text(chunk) for chunk in chunks]

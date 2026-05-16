@@ -718,3 +718,182 @@ PY
 2. dense on으로 다시 실행
 3. 샘플/실제 질문에서 답이 유지되는지 확인
 4. `validator.py` 통과 여부 재확인
+
+## 추가 구현 메모: parsing-chunking-email 브랜치 poisoning 방지 반영
+
+아래 내용은 `origin/parsing-chunking-email` 브랜치에서 추가된 poisoning 방지 아이디어를 현재 하이브리드 RAG 파이프라인에 반영한 메모입니다.
+
+### 1. 무엇을 추가했는가
+
+이번 단계에서 추가된 핵심은 “문서를 인덱싱하기 전에 instruction-like poison을 먼저 잘라낸다”는 점입니다.
+
+기존 구현은 대략 아래 수준이었습니다.
+
+- chunk 생성 후 `injection_score` 계산
+- suspicious chunk를 retrieval에서 후순위화
+- secure prompt로 문서 내 지시를 무시하게 유도
+
+즉, poison을 “탐지하고 경계”하는 쪽이 중심이었습니다.
+
+반면 이번 업데이트는:
+
+- poison block을 문서 파싱/청킹 단계에서 sanitize
+- 그 흔적을 chunk metadata에 남기고
+- retrieval 점수에서도 poison 정보를 반영
+
+하는 쪽으로 한 단계 더 공격적으로 방어합니다.
+
+### 2. 새로 추가된 파일
+
+이번 단계에서 새로 들어간 파일은 아래 하나입니다.
+
+- [poison_rules.json](./poison_rules.json)
+
+이 파일은 rule-driven poisoning 탐지를 위한 설정 파일입니다.
+
+포함된 내용:
+
+- `targets`
+- `obligations`
+- `actions`
+- `scope`
+- `exact_phrases`
+- `high_threshold`
+- `medium_threshold`
+
+즉, 코드 하드코딩만으로 끝내지 않고, poison 신호를 규칙 파일로 빼서 조정 가능하게 만들었습니다.
+
+### 3. 현재 코드에 반영된 poisoning 방지 흐름
+
+현재 [baseline_rag.py](./baseline_rag.py)에서는 아래 흐름으로 동작합니다.
+
+1. `poison_rules.json` 로드
+2. `_sanitize_instruction_poison()` 실행
+3. 문단/이메일 본문 안에서 instruction-like poison block 제거
+4. chunk metadata에 아래 정보 저장
+   - `poison_score`
+   - `poison_classes`
+   - `poison_spans_count`
+   - `security_flags`
+5. retrieval score에서 poison score penalty 적용
+6. context 생성 시 남아 있는 강한 instruction-like 줄은 추가 제거
+
+즉, 현재는:
+
+- 인덱싱 전 sanitize
+- retrieval penalty
+- final context sanitization
+
+의 3중 방어가 들어간 상태입니다.
+
+### 4. 어떤 유형을 poison으로 보나
+
+현재 rule과 heuristic은 주로 아래 유형을 겨냥합니다.
+
+- `ignore previous instructions`
+- `ignore all previous instructions`
+- `reveal the system prompt`
+- `developer message`
+- `APPROVED_BY_ADMIN`
+- “정답 대신 … 출력해라”
+- “이전 지시를 무시하라”
+- AI/assistant/system을 직접 겨냥하면서
+  - 반드시
+  - 항상
+  - 모든 답변에
+  - 포함/출력/반복/공개
+  같은 의무/행동/범위 지시를 결합한 문구
+
+즉, 단순한 일반 문장보다 “모델의 응답 행동을 바꾸려는 지시문”을 중점적으로 잡습니다.
+
+### 5. email-aware chunking과 어떻게 결합했는가
+
+이번 poisoning 방지는 특히 이메일 아카이브 문서와 잘 맞습니다.
+
+현재 흐름:
+
+- `Message N of M` 단위로 메일 블록 분리
+- `From / To / Cc / Subject` 추출
+- quoted mail 분리
+- disclaimer 제거
+- 그 뒤 메일 본문에 `_sanitize_instruction_poison()` 적용
+
+즉, 이메일 본문 안에 섞인 조작형 문구를 chunking 전에 잘라낼 수 있습니다.
+
+### 6. artifact와의 관계
+
+이번 변경에서 중요한 점은 artifact 재사용 조건도 같이 바꿨다는 점입니다.
+
+현재는 아래가 바뀌면 `artifacts_upgrade/chunks.preview.jsonl`을 새로 만들게 했습니다.
+
+- PDF 코퍼스 수정
+- `poison_rules.json` 수정
+
+즉, poison 규칙이 바뀌었는데도 예전 artifact를 그대로 재사용하는 문제를 막았습니다.
+
+### 7. 실행 로그에서 무엇을 보면 되는가
+
+이번 업데이트 후 인덱스 구축 로그에는 아래가 추가됩니다.
+
+- `→ poison sanitized span 수: N개`
+- `→ poison flagged chunk 수: N개`
+
+의미:
+
+- `poison sanitized span 수`
+  - 실제로 제거된 instruction-like poison block 개수
+- `poison flagged chunk 수`
+  - 제거되진 않았지만 suspicious/poison score가 올라간 chunk 개수
+
+### 8. 실제 검증 결과
+
+실제로 이번 업데이트 반영 후 다시 실행해서 확인한 결과:
+
+- `poison sanitized span 수: 0개`
+- `poison flagged chunk 수: 1개`
+
+샘플 코퍼스에서는:
+
+- 완전히 제거할 정도의 강한 poison block은 없었고
+- 의심 청크 1개는 metadata로 표시되어 retrieval에서 불리하게 처리됨
+
+그리고 샘플 질문 결과는 그대로 유지됐습니다.
+
+- `Q_001 -> 전략기획부`
+- `Q_002 -> 이서연 팀장`
+- `Q_003 -> 60%`
+- `Q_061 -> 2026년 3월 15일`
+- `Q_081 -> 정보 없음`
+
+즉, poisoning 방지를 강화했지만 reasoning 성능 회귀는 없었습니다.
+
+### 9. dense on 상태에서도 유지되는가
+
+이 업데이트 후 dense on 상태도 다시 확인했습니다.
+
+```bash
+ENABLE_DENSE_RETRIEVAL=1 UPSTAGE_API_KEY='...' python baseline_rag.py
+```
+
+확인된 상태:
+
+- dense index 로드 정상
+- embedding model 로딩 정상
+- poison 로그 정상 출력
+- 샘플 5문항 정답 유지
+- `submission.csv` 생성 성공
+- `validator.py` 통과
+
+즉, poisoning 방지 업데이트가 dense retrieval 경로를 깨뜨리지는 않았습니다.
+
+### 10. 현재 해석
+
+이번 업데이트의 의미는 다음과 같습니다.
+
+- 이전:
+  - poison을 “후순위화”하는 수준
+- 현재:
+  - poison을 “인덱싱 전 sanitize + metadata 추적 + 검색 패널티”까지 포함해 다층 방어
+
+즉, 현재 파이프라인은 단순 secure prompt 기반 방어를 넘어서,
+문서 ingestion 단계에서부터 poisoning을 줄이는 구조로 업그레이드된 상태입니다.

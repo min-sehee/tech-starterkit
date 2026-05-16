@@ -1,0 +1,30 @@
+{
+  "version": "v1",
+  "signals": {
+    "targets": [
+      "\\b(ai|retrieval)\\s+(systems?|system|assistant)\\b",
+      "\\b(system prompt|developer message)\\b"
+    ],
+    "obligations": [
+      "\\b(must|required|mandated|should|반드시|무조건)\\b"
+    ],
+    "actions": [
+      "\\b(append|include|confirm|output|print|repeat|reveal|disclose)\\b",
+      "\\b(출력|반복|공개|노출|포함|추가)\\b"
+    ],
+    "scope": [
+      "\\b(every response|each response|each answer|always|모든 답변|항상)\\b"
+    ]
+  },
+  "high_threshold": 3,
+  "medium_threshold": 2,
+  "exact_phrases": [
+    "approved_by_admin",
+    "ignore previous instructions",
+    "ignore all previous instructions",
+    "reveal the system prompt",
+    "developer message",
+    "정답 대신",
+    "이전 지시를 무시"
+  ]
+}
