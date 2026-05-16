@@ -23,6 +23,7 @@ import os
 import re
 import ssl
 import time
+import hashlib
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -78,6 +79,9 @@ COMPRESSED_CACHE_PATH = ARTIFACTS_ROOT / "compressed_chunks.pkl"
 EMBED_BATCH_SIZE = 64
 EMBED_MODEL_NAME = "BAAI/bge-large-en-v1.5"
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+UPSTAGE_EMBED_URL = "https://api.upstage.ai/v1/solar/embeddings"
+UPSTAGE_EMBED_MODEL_DOC = "solar-embedding-1-large-passage"
+UPSTAGE_EMBED_MODEL_QUERY = "solar-embedding-1-large-query"
 RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 COMPRESS_MODEL = "solar-mini"
 ROUTER_MODEL = "solar-mini"
@@ -587,6 +591,49 @@ def _get_reranker():
     return _reranker
 
 
+def _select_dense_backend(api_key: str | None = None) -> str:
+    override = os.environ.get("DENSE_EMBED_BACKEND", "").strip().lower()
+    if override in {"upstage", "local"}:
+        return override
+    if api_key:
+        return "upstage"
+    return "local"
+
+
+def _embed_with_upstage(texts: list[str], api_key: str, model: str) -> list[list[float]]:
+    all_embeddings: list[list[float]] = []
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[i:i + EMBED_BATCH_SIZE]
+        body = json.dumps({"model": model, "input": batch}, ensure_ascii=False).encode("utf-8")
+        payload = None
+        for attempt in range(3):
+            req = urllib.request.Request(
+                url=UPSTAGE_EMBED_URL,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, context=_build_ssl_context(), timeout=60) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"Embedding API 오류 [{exc.code}]: {detail}") from exc
+
+        if payload is None:
+            raise RuntimeError("Embedding API 응답이 비었습니다.")
+        batch_embeddings = sorted(payload["data"], key=lambda item: item["index"])
+        all_embeddings.extend(item["embedding"] for item in batch_embeddings)
+    return all_embeddings
+
+
 def _embed_texts(texts: list[str], is_query: bool = False) -> list[list[float]]:
     model = _get_embed_model()
     model_inputs = [BGE_QUERY_PREFIX + text for text in texts] if is_query else texts
@@ -597,6 +644,21 @@ def _embed_texts(texts: list[str], is_query: bool = False) -> list[list[float]]:
         normalize_embeddings=True,
     )
     return embeddings.tolist()
+
+
+def _embed_texts_with_backend(
+    texts: list[str],
+    *,
+    is_query: bool = False,
+    backend: str = "local",
+    api_key: str | None = None,
+) -> list[list[float]]:
+    if backend == "upstage":
+        if not api_key:
+            raise RuntimeError("Upstage embedding backend requires UPSTAGE_API_KEY.")
+        model = UPSTAGE_EMBED_MODEL_QUERY if is_query else UPSTAGE_EMBED_MODEL_DOC
+        return _embed_with_upstage(texts, api_key, model)
+    return _embed_texts(texts, is_query=is_query)
 
 
 def _build_embed_text(chunk: dict) -> str:
@@ -996,6 +1058,31 @@ def _clean_email_body(text_body: str) -> tuple[str, bool]:
     return cleaned, disclaimer_removed
 
 
+def _is_low_information_signature(body: str) -> bool:
+    words = body.split()
+    if len(words) > 45:
+        return False
+    email_count = len(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", body))
+    phone_count = len(re.findall(r"\b\d{2,4}[- .]\d{3,4}[- .]\d{4}\b", body))
+    org_count = len(re.findall(r"(?i)\b(company|corporation|services|fax|phone|mobile|tel|ext)\b", body))
+    sentence_count = len(re.findall(r"[.!?]", body))
+    return (email_count + phone_count + org_count >= 3) and sentence_count <= 1
+
+
+def _hash_email(email_subject: str, email_from: str, email_sent, clean_body: str) -> str:
+    normalized = "\n".join(
+        [
+            (email_subject or "").lower(),
+            (email_from or "").lower(),
+            (str(email_sent) if email_sent else "").lower(),
+            clean_body.lower(),
+        ]
+    )
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"(?i)confidential|internal email archive", "", normalized)
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+
+
 def _build_email_chunk_text(subject: str, email_from: str, sent_at, body: str) -> str:
     lines = []
     if subject and subject != "unknown":
@@ -1348,12 +1435,12 @@ def _compressed_cache_usable(corpus_dir: str) -> bool:
     return _artifact_is_usable(corpus_dir) and COMPRESSED_CACHE_PATH.exists()
 
 
-def _build_dense_index(chunks: list[dict]):
-    if chromadb is None or SentenceTransformer is None:
+def _build_dense_index(chunks: list[dict], *, backend: str, api_key: str | None):
+    if chromadb is None:
         return None
 
     texts = [_build_embed_text(chunk) for chunk in chunks]
-    embeddings = _embed_texts(texts)
+    embeddings = _embed_texts_with_backend(texts, backend=backend, api_key=api_key)
 
     print("  ChromaDB 저장 중...")
     chroma_client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
@@ -1363,7 +1450,7 @@ def _build_dense_index(chunks: list[dict]):
         pass
     collection = chroma_client.create_collection(
         CHROMA_COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
+        metadata={"hnsw:space": "cosine", "backend": backend},
     )
     collection.add(
         documents=texts,
@@ -1383,8 +1470,8 @@ def _build_dense_index(chunks: list[dict]):
     return collection
 
 
-def _load_dense_index(chunks: list[dict]):
-    if chromadb is None or SentenceTransformer is None or not CHROMA_PERSIST_DIR.exists():
+def _load_dense_index(chunks: list[dict], *, backend: str, api_key: str | None):
+    if chromadb is None or not CHROMA_PERSIST_DIR.exists():
         return None
 
     chroma_client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
@@ -1394,10 +1481,13 @@ def _load_dense_index(chunks: list[dict]):
         return None
 
     try:
+        collection_backend = (collection.metadata or {}).get("backend")
+        if collection_backend != backend:
+            return _build_dense_index(chunks, backend=backend, api_key=api_key)
         if collection.count() != len(chunks):
-            return _build_dense_index(chunks)
+            return _build_dense_index(chunks, backend=backend, api_key=api_key)
     except Exception:
-        return _build_dense_index(chunks)
+        return _build_dense_index(chunks, backend=backend, api_key=api_key)
     return collection
 
 
@@ -1433,7 +1523,7 @@ def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict
                     }
                 ]
 
-            dedup_seen = set()
+            dedup_map: dict[str, int] = {}
             for entry in message_entries:
                 block_clean = _remove_noise_after_message_split(entry["block"])
                 container_meta, message_body = _extract_container_header_and_body(block_clean)
@@ -1457,17 +1547,12 @@ def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict
                     clean_body, disclaimer_removed = _clean_email_body(sanitized_body)
                     if not clean_body:
                         continue
+                    low_information = _is_low_information_signature(clean_body)
+                    if low_information and len(blocks) > 1:
+                        continue
 
                     chunk_text_value = _build_email_chunk_text(email_subject, email_from, email_sent, clean_body)
-                    dedup_key = (
-                        email_subject.lower(),
-                        email_from.lower(),
-                        (str(email_sent).lower() if email_sent else ""),
-                        clean_body.lower(),
-                    )
-                    if role == "quoted_message" and dedup_key in dedup_seen:
-                        continue
-                    dedup_seen.add(dedup_key)
+                    email_hash = _hash_email(email_subject, email_from, email_sent, clean_body) if role == "quoted_message" else None
 
                     email_chunks = [chunk_text_value]
                     if _word_count(clean_body) > target_words:
@@ -1478,6 +1563,18 @@ def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict
                         if not text:
                             continue
                         injection_score = score_injection(text)
+                        archive_ref = {
+                            "source": Path(source).stem,
+                            "archive_message_no": entry["archive_message_no"],
+                            "archive_total_messages": entry["archive_total_messages"],
+                            "page": entry["start_page"],
+                            "display_order": display_order,
+                        }
+                        if role == "quoted_message" and email_hash:
+                            existing_idx = dedup_map.get(email_hash)
+                            if existing_idx is not None:
+                                all_chunks[existing_idx]["metadata"].setdefault("archive_refs", []).append(archive_ref)
+                                continue
                         all_chunks.append(
                             {
                                 "doc_id": Path(source).stem,
@@ -1506,8 +1603,11 @@ def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict
                                     "archive_file_path": container_meta["archive_file_path"],
                                     "on_behalf_of": on_behalf_of,
                                     "disclaimer_removed": disclaimer_removed,
+                                    "low_information": low_information,
                                     "contains_table": False,
                                     "email_chunk_unit_index": unit_idx,
+                                    "email_hash": email_hash,
+                                    "archive_refs": [archive_ref] if role == "quoted_message" and email_hash else [],
                                     "security_flags": poison_info.get("security_flags", []),
                                     "poison_score": poison_info.get("poison_score", 0),
                                     "poison_classes": poison_info.get("poison_classes", []),
@@ -1515,6 +1615,8 @@ def _build_chunks_via_document_parse(corpus_dir: str, api_key: str) -> list[dict
                                 },
                             }
                         )
+                        if role == "quoted_message" and email_hash:
+                            dedup_map[email_hash] = len(all_chunks) - 1
                         global_chunk_index += 1
             continue
 
@@ -1854,7 +1956,12 @@ def select_chunks(question: str, index: dict, query_text: str, top_k: int) -> li
     chunk_id_to_index = index.get("chunk_id_to_index", {})
     if dense_collection is not None:
         try:
-            query_embedding = _embed_texts([query_text], is_query=True)[0]
+            query_embedding = _embed_texts_with_backend(
+                [query_text],
+                is_query=True,
+                backend=index.get("dense_backend", "local"),
+                api_key=index.get("api_key"),
+            )[0]
             dense_result = dense_collection.query(
                 query_embeddings=[query_embedding],
                 n_results=RETRIEVAL_POOL_SIZE,
@@ -2172,20 +2279,24 @@ def build_index(corpus_dir: str):
                 compressed = {}
 
     dense_collection = None
-    dense_enabled = chromadb is not None and SentenceTransformer is not None
+    dense_backend = _select_dense_backend(api_key)
+    dense_enabled = chromadb is not None and (
+        (dense_backend == "upstage" and bool(api_key))
+        or (dense_backend == "local" and SentenceTransformer is not None)
+    )
     if dense_enabled:
         try:
             if _dense_cache_usable(corpus_dir):
                 print(f"  → dense index 로드: {CHROMA_PERSIST_DIR}")
-                dense_collection = _load_dense_index(chunks)
+                dense_collection = _load_dense_index(chunks, backend=dense_backend, api_key=api_key)
             else:
-                dense_collection = _build_dense_index(chunks)
+                dense_collection = _build_dense_index(chunks, backend=dense_backend, api_key=api_key)
                 print(f"  → dense index 저장: {CHROMA_PERSIST_DIR}")
         except Exception as exc:
             print(f"  [warn] dense retrieval index 실패, sparse-only로 진행: {exc}")
             dense_collection = None
     else:
-        print("  [warn] chromadb 또는 sentence-transformers 미설치: sparse retrieval만 사용합니다.")
+        print("  [warn] dense backend 준비 미완료: sparse retrieval만 사용합니다.")
 
     print("  인덱스 구축 완료\n")
     return {
@@ -2197,6 +2308,8 @@ def build_index(corpus_dir: str):
         "chunk_id_to_index": chunk_id_to_index,
         "compressed": compressed,
         "dense_collection": dense_collection,
+        "dense_backend": dense_backend,
+        "api_key": api_key,
     }
 
 

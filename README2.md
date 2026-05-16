@@ -897,3 +897,197 @@ ENABLE_DENSE_RETRIEVAL=1 UPSTAGE_API_KEY='...' python baseline_rag.py
 
 즉, 현재 파이프라인은 단순 secure prompt 기반 방어를 넘어서,
 문서 ingestion 단계에서부터 poisoning을 줄이는 구조로 업그레이드된 상태입니다.
+
+## 추가 구현 메모: sehee 브랜치에서 1, 2, 5번 반영
+
+아래 내용은 `origin/sehee`에서 특히 이메일형 코퍼스에 유리하다고 판단한 세 가지를 현재 코드에 반영한 메모입니다.
+
+- 1. Upstage Embedding API dense 경로
+- 2. quoted email dedup + `archive_refs`
+- 5. low-information signature 제거 강화
+
+### 1. 왜 이 세 가지를 골랐는가
+
+대회 당일 이메일 형식 문서가 많이 들어온다면, 일반 문서 RAG와 다르게 아래 문제가 커집니다.
+
+- 같은 메일 본문이 quoted message로 반복됨
+- 의미 없는 서명/연락처 덩어리가 chunk를 오염시킴
+- dense embedding 환경 준비가 로컬 HF 모델에 의존하면 불안정해질 수 있음
+
+즉, 이메일 대량 코퍼스에서는:
+
+- dedup
+- signature 제거
+- embedding backend 안정성
+
+이 실제 점수와 latency에 큰 영향을 줄 수 있습니다.
+
+### 2. Upstage Embedding API dense 경로 추가
+
+기존 dense 구현은 주로:
+
+- `SentenceTransformer`
+- `BAAI/bge-large-en-v1.5`
+- `ChromaDB`
+
+조합을 사용했습니다.
+
+이번에는 여기에 Upstage embedding backend도 추가했습니다.
+
+사용 모델:
+
+- `solar-embedding-1-large-passage`
+- `solar-embedding-1-large-query`
+
+현재 구조:
+
+- `DENSE_EMBED_BACKEND=upstage`
+  - Upstage Embedding API 사용
+- `DENSE_EMBED_BACKEND=local`
+  - 기존 local sentence-transformers 사용
+- 환경변수 미지정 시
+  - `UPSTAGE_API_KEY`가 있으면 `upstage`를 기본 우선 사용
+
+즉, 지금은 dense retrieval이:
+
+- local HF 모델 기반
+- Upstage API 기반
+
+두 경로를 모두 지원하게 됐습니다.
+
+### 3. Upstage embedding backend의 의미
+
+이 변경의 실전적 의미는 명확합니다.
+
+- Hugging Face 모델 다운로드/캐시 이슈를 줄일 수 있음
+- macOS / conda / 네트워크 환경 차이에 덜 민감해짐
+- dense retrieval을 Upstage API 중심으로 더 일관되게 운용 가능
+
+즉, 로컬 환경 의존성이 줄어들고 운영성이 좋아집니다.
+
+### 4. dense cache 재생성 로직도 함께 변경
+
+이전에는 Chroma cache가 존재하면 그대로 재사용했습니다.
+
+이번에는 collection metadata에 `backend` 정보를 저장하고,
+다음 경우 자동 재생성되게 했습니다.
+
+- 예전 local backend cache인데 지금은 upstage backend를 쓰는 경우
+- collection count가 현재 chunk 수와 맞지 않는 경우
+
+즉, “dense backend는 바뀌었는데 예전 벡터를 계속 재사용하는 문제”를 막았습니다.
+
+### 5. quoted email dedup + archive_refs 추가
+
+`sehee` 브랜치에서 특히 가져올 가치가 컸던 부분입니다.
+
+현재 quoted email 처리 방식:
+
+- quoted message는 `email_hash` 계산
+- 동일 quoted 본문이 다시 나오면 새 chunk를 만들지 않음
+- 대신 기존 대표 chunk의 metadata에 `archive_refs`를 추가
+
+`archive_refs`에 들어가는 정보 예:
+
+- source
+- archive_message_no
+- archive_total_messages
+- page
+- display_order
+
+즉, 완전히 버리는 dedup이 아니라
+“대표 chunk는 유지하고, 중복 출처는 참조로 남기는 dedup”입니다.
+
+### 6. quoted dedup의 실전적 의미
+
+이메일 스레드 문서는 quoted message가 매우 자주 중복됩니다.
+
+이 중복을 그대로 두면:
+
+- chunk 수가 불필요하게 늘고
+- BM25 / TF-IDF / dense candidate pool이 지저분해지고
+- context 길이가 낭비되고
+- latency까지 불리해집니다
+
+지금 구조는 중복 quoted 본문을 줄이면서도
+“이 청크가 어디서 재등장했는지”는 `archive_refs`로 추적할 수 있게 했습니다.
+
+즉, retrieval 품질과 추적 가능성을 같이 챙기는 구조입니다.
+
+### 7. low-information signature 제거 강화
+
+이메일 문서에서 흔한 문제는:
+
+- 이름
+- 전화번호
+- 팩스
+- 회사명
+- 짧은 직함
+
+만 반복되는 서명 block이 본문처럼 들어가는 것입니다.
+
+이번에는 `_is_low_information_signature()`를 넣어 아래 유형을 더 강하게 제외합니다.
+
+- 단어 수가 짧고
+- 이메일/전화/조직명 패턴이 여러 개 있고
+- 실질 문장 정보가 거의 없는 block
+
+특히 multi-message 스레드에서는:
+
+- quoted 본문은 남기되
+- 서명만 남은 덩어리는 건너뛰게 했습니다
+
+즉, context 오염을 줄이기 위한 이메일 전용 후처리 강화입니다.
+
+### 8. 현재 코드에서 어떻게 동작하나
+
+현재 이메일형 chunking 흐름은 아래처럼 됩니다.
+
+1. `Message N of M` 단위 분리
+2. `From / To / Cc / Subject` 추출
+3. quoted/current block 분리
+4. poisoning sanitize 적용
+5. disclaimer 제거
+6. low-information signature 제거
+7. quoted email hash dedup
+8. `archive_refs` 저장
+9. chunk 생성
+
+즉, 예전보다 “이메일형 문서 전용 ingestion 파이프라인”이 더 명확해졌습니다.
+
+### 9. 실제 실행 확인 결과
+
+이번 변경 반영 후 dense on 상태로 다시 실행해 확인했습니다.
+
+```bash
+ENABLE_DENSE_RETRIEVAL=1 UPSTAGE_API_KEY='...' python baseline_rag.py
+```
+
+실행 로그상 확인된 점:
+
+- `→ dense index 로드: artifacts_upgrade/chroma`
+- backend mismatch 때문에 한 번 `ChromaDB 저장 중...`이 다시 뜰 수 있음
+- 샘플 5문항 모두 유지
+
+결과:
+
+- `Q_001 -> 전략기획부`
+- `Q_002 -> 이서연 팀장`
+- `Q_003 -> 60%`
+- `Q_061 -> 2026년 3월 15일`
+- `Q_081 -> 정보 없음`
+- `submission.csv` 생성 성공
+- `validator.py` 통과
+
+즉, 1/2/5번 반영 후에도 기존 정답 회귀는 없었습니다.
+
+### 10. 현재 해석
+
+이번 단계의 의미를 짧게 요약하면:
+
+- dense retrieval backend는 더 운영 친화적으로 되었고
+- 이메일 quoted 중복은 더 잘 줄였고
+- 의미 없는 서명 chunk는 더 잘 제거하게 되었습니다
+
+즉, 현재 코드는 일반 문서 RAG라기보다
+“이메일 대량 코퍼스도 버틸 수 있는 쪽으로 ingestion이 더 강화된 상태”라고 볼 수 있습니다.
