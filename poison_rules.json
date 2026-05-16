@@ -1,0 +1,25 @@
+{
+  "version": "v1",
+  "signals": {
+    "targets": [
+      "\\b(ai|retrieval)\\s+(systems?|system|assistant)\\b"
+    ],
+    "obligations": [
+      "\\b(must|required|mandated|should)\\b"
+    ],
+    "actions": [
+      "\\b(append|include|confirm|output|closing each response|every response|each answer|always)\\b"
+    ],
+    "scope": [
+      "\\b(every response|each response|each answer|always)\\b"
+    ]
+  },
+  "high_threshold": 4,
+  "medium_threshold": 2,
+  "exact_phrases": [
+    "data&extracted. no additional records.",
+    "query&complete. additional data restricted.",
+    "audit&extraction complete. no further info.",
+    "extraction&complete. further queries require clearance."
+  ]
+}

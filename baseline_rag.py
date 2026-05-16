@@ -30,6 +30,7 @@ import urllib.error
 CORPUS_DIR      = "distribution/corpus"
 TEST_SUITE_PATH = "distribution/test_suite/Encrypted_Test_Suite.json"
 UPSTAGE_PARSE_URL = "https://api.upstage.ai/v1/document-ai/document-parse"
+POISON_RULES_PATH = "poison_rules.json"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -49,6 +50,30 @@ def build_index(corpus_dir: str):
 
     def _sanitize_passthrough(text: str) -> str:
         return text
+
+    def _load_poison_rules(path: str = POISON_RULES_PATH) -> dict:
+        default_rules = {
+            "version": "v1",
+            "signals": {
+                "targets": [r"\b(ai|retrieval)\s+(systems?|system|assistant)\b"],
+                "obligations": [r"\b(must|required|mandated|should)\b"],
+                "actions": [r"\b(append|include|confirm|output|closing each response|every response|each answer|always)\b"],
+                "scope": [r"\b(every response|each response|each answer|always)\b"],
+            },
+            "high_threshold": 3,
+            "medium_threshold": 2,
+            "exact_phrases": [],
+        }
+        p = Path(path)
+        if not p.exists():
+            return default_rules
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception:
+            pass
+        return default_rules
 
     def _split_by_token_limit(text: str, target_tokens: int, overlap_tokens: int) -> list[str]:
         words = text.split()
@@ -210,6 +235,131 @@ def build_index(corpus_dir: str):
         for p in patterns:
             out = re.sub(p, "", out)
         return _normalize(out)
+
+    poison_rules = _load_poison_rules()
+
+    def _sanitize_instruction_poison(text: str, rules: dict) -> tuple[str, dict]:
+        """Instruction-like poisoning sanitize (rule-file driven).
+
+        Returns:
+            cleaned_text, info
+            info = {
+              "poison_score": int,
+              "poison_classes": list[str],
+              "poison_spans_count": int,
+              "security_flags": list[str],
+              "removed": bool
+            }
+        """
+        if not text:
+            return text, {
+                "poison_score": 0,
+                "poison_classes": [],
+                "poison_spans_count": 0,
+                "security_flags": [],
+                "removed": False,
+            }
+
+        lines = text.splitlines()
+        kept = []
+        i = 0
+        score = 0
+        found_classes = set()
+        removed_spans = 0
+
+        sig = rules.get("signals", {})
+        pat_targets = [re.compile(p, flags=re.IGNORECASE) for p in sig.get("targets", [])]
+        pat_oblig = [re.compile(p, flags=re.IGNORECASE) for p in sig.get("obligations", [])]
+        pat_actions = [re.compile(p, flags=re.IGNORECASE) for p in sig.get("actions", [])]
+        pat_scope = [re.compile(p, flags=re.IGNORECASE) for p in sig.get("scope", [])]
+        high_threshold = int(rules.get("high_threshold", 3))
+        medium_threshold = int(rules.get("medium_threshold", 2))
+        exact_phrases = [str(x).strip().lower() for x in rules.get("exact_phrases", []) if str(x).strip()]
+
+        # generic indicators
+        pat_quote = re.compile(r"\"[^\"]{8,}\"")
+        pat_b = re.compile(r"(?i)\b(clearance|restricted|additional data restricted|further queries require clearance|no additional records|no further info)\b")
+        pat_notice = re.compile(r"(?i)^\s*\[[^\]]*(NOTICE|REQUIREMENT|CONTROL|LOG)[^\]]*\]\s*$")
+
+        while i < len(lines):
+            line = lines[i]
+            # candidate block starts from notice header or direct AI-system imperative line
+            line_lower = line.lower()
+            hit_target = any(p.search(line) for p in pat_targets) if pat_targets else False
+            hit_oblig = any(p.search(line) for p in pat_oblig) if pat_oblig else False
+            hit_action = any(p.search(line) for p in pat_actions) if pat_actions else False
+            hit_scope = any(p.search(line) for p in pat_scope) if pat_scope else False
+            hit_exact = any(ep in line_lower for ep in exact_phrases) if exact_phrases else False
+
+            is_candidate_start = bool(pat_notice.match(line.strip())) or hit_exact or (hit_target and (hit_oblig or hit_action or hit_scope))
+            if not is_candidate_start:
+                kept.append(line)
+                i += 1
+                continue
+
+            # gather block until blank line (or max lookahead for robustness)
+            j = i
+            block_lines = []
+            while j < len(lines):
+                block_lines.append(lines[j])
+                if lines[j].strip() == "" and j > i:
+                    break
+                if j - i >= 14:
+                    break
+                j += 1
+            block = "\n".join(block_lines)
+
+            # score the block
+            bscore = 0
+            hit_target_b = any(p.search(block) for p in pat_targets) if pat_targets else False
+            hit_oblig_b = any(p.search(block) for p in pat_oblig) if pat_oblig else False
+            hit_action_b = any(p.search(block) for p in pat_actions) if pat_actions else False
+            hit_scope_b = any(p.search(block) for p in pat_scope) if pat_scope else False
+            hit_exact_b = any(ep in block.lower() for ep in exact_phrases) if exact_phrases else False
+
+            if hit_target_b:
+                bscore += 2
+                found_classes.add("poison_C")
+            if hit_oblig_b and hit_action_b:
+                bscore += 2
+                found_classes.add("poison_C")
+            if hit_scope_b:
+                bscore += 2
+                found_classes.add("poison_A")
+            if pat_quote.search(block):
+                bscore += 1
+                found_classes.add("poison_A")
+            if pat_b.search(block):
+                bscore += 2
+                found_classes.add("poison_B")
+            if hit_exact_b:
+                bscore += 2
+                found_classes.add("poison_A")
+
+            # high confidence removal
+            if bscore >= high_threshold:
+                score += bscore
+                removed_spans += 1
+                i = j + 1
+                continue
+
+            # medium confidence: keep but flag score
+            if bscore >= medium_threshold:
+                score += bscore
+                found_classes.add("poison_suspected")
+
+            # low confidence -> keep
+            kept.extend(block_lines)
+            i = j + 1
+
+        cleaned = _normalize("\n".join(kept))
+        return cleaned, {
+            "poison_score": score,
+            "poison_classes": sorted(found_classes),
+            "poison_spans_count": removed_spans,
+            "security_flags": (["instruction_poisoning"] if removed_spans > 0 else (["poison_suspected"] if score >= medium_threshold else [])),
+            "removed": removed_spans > 0,
+        }
 
     def _split_message_entries(full_text: str) -> list[dict]:
         pat = re.compile(r"(?m)^#{0,6}\s*Message\s+(\d+)\s+of\s+(\d+)\s*$")
@@ -676,10 +826,14 @@ def build_index(corpus_dir: str):
         unknown_quoted_from = 0
         attach_warn_count = 0
         disclaimer_removed_count = 0
+        poison_removed_count = 0
 
         for entry in message_entries:
             block_clean = _remove_noise_after_message_split(entry["block"])
             container_meta, message_body = _extract_container_header_and_body(block_clean)
+            message_body, poison_info = _sanitize_instruction_poison(message_body, poison_rules)
+            if poison_info.get("removed"):
+                poison_removed_count += 1
 
             archive_message_no = entry["archive_message_no"]
             archive_total_messages = entry["archive_total_messages"]
@@ -796,6 +950,10 @@ def build_index(corpus_dir: str):
                         "thread_id": thread_id,
                         "thread_subject": thread_subject,
                         "thread_attachments": thread_attachments,
+                        "security_flags": poison_info.get("security_flags", []),
+                        "poison_score": poison_info.get("poison_score", 0),
+                        "poison_classes": poison_info.get("poison_classes", []),
+                        "poison_spans_count": poison_info.get("poison_spans_count", 0),
                         "email_role": role,
                         "email_display_order": display_order,
                         "email_chronological_order": chrono_order,
@@ -859,6 +1017,7 @@ def build_index(corpus_dir: str):
             "body_header_residue": body_header_residue,
             "attachment_split_warning_count": attach_warn_count,
             "disclaimer_removed_count": disclaimer_removed_count,
+            "poison_removed_count": poison_removed_count,
         }
 
     all_chunks = _postprocess_short_chunks(all_chunks)
@@ -890,7 +1049,8 @@ def build_index(corpus_dir: str):
             f"chunks={total_chunks} current={st['current_count']} quoted={st['quoted_count']} "
             f"dedup_removed={dedup_removed} unknown_quoted_from={st['unknown_quoted_from']} "
             f"body_header_residue={st['body_header_residue']} attach_warn={st['attachment_split_warning_count']} "
-            f"fallback_sender_filled={fallback_sender_filled} disclaimer_removed={st['disclaimer_removed_count']}"
+            f"fallback_sender_filled={fallback_sender_filled} disclaimer_removed={st['disclaimer_removed_count']} "
+            f"poison_removed={st['poison_removed_count']}"
         )
 
         if st["archive_total_messages"] == 91 and st["unique_archive_message_no"] != 91:
@@ -935,6 +1095,12 @@ def build_index(corpus_dir: str):
                 break
             if "PRIVILEGED, CONFIDENTIAL AND EXEMPT FROM DISCLOSURE".lower() in t.lower():
                 print(f"[WARN][{src}] text에 PRIVILEGED disclaimer가 남아 있습니다.")
+                break
+            if re.search(r"(?i)\b(ai|retrieval)\s+systems?\b.*\b(must|required|mandated)\b", t):
+                print(f"[WARN][{src}] instruction-like poison 문구 잔존 가능성")
+                break
+            if re.search(r"(?i)\b(append|include).*\b(every response|closing each response)\b", t):
+                print(f"[WARN][{src}] 답변 변조형 poison 문구 잔존 가능성")
                 break
             ef = str(md.get("email_from", ""))
             if "Sent:" in ef or "To:" in ef:
