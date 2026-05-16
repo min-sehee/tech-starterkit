@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# 인덱스 캐시 (로컬 생성물)
+.index_bm25.pkl
+.index_chunks.pkl
+.index_compressed.pkl
+.index_chroma/
+
+# 환경변수
+.env
+set_env.local.ps1
+set_env.local.sh
+
+# 제출 결과물
+submission.csv
+artifacts/
+
+# 테스트 평문
+test_suite_plain.json
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 임시 파일
+*.tmp
+_scan_poison.py
+*.pdf
