@@ -52,11 +52,13 @@ EMBED_MODEL_DOC    = "solar-embedding-1-large-passage"
 EMBED_MODEL_QUERY  = "solar-embedding-1-large-query"
 MAX_ANSWER_CHARS   = 1200
 
-# 출력 민감정보 패턴 (문서8에서 가져옴)
+# 출력 민감정보 패턴
 SENSITIVE_OUTPUT_PATTERNS = {
-    "rrn":            re.compile(r"\b\d{6}-\d{7}\b"),
+    "rrn":            re.compile(r"\b\d{6}-\d{7}\b"),                        # 주민등록번호
+    "ssn":            re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),                  # SSN
+    "credit_card":    re.compile(r"\b\d{4}[\s\-]\d{4}[\s\-]\d{4}[\s\-]\d{4}\b"),
     "secret":         re.compile(
-        r"\b(?:api[_ -]?key|access[_ -]?token|secret[_ -]?key|password|passwd|token)\b",
+        r"\b(?:api[_ -]?key|access[_ -]?token|secret[_ -]?key|password|passwd)\b",
         re.IGNORECASE,
     ),
     "approval_token": re.compile(r"\bAPPROVED_BY_ADMIN\b", re.IGNORECASE),
@@ -1341,6 +1343,18 @@ def build_index(corpus_dir: str):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 PII_PATTERNS = [
+    # ── English PII (Enron email corpus) ──────────────────────────────────
+    r"\bsocial\s+security\s+(number|no\.?|#)\b",
+    r"\bSSN\b",
+    r"\b\d{3}-\d{2}-\d{4}\b",                        # SSN 형식
+    r"\b(bank\s+)?account\s+(number|no\.?|#)\b",
+    r"\brouting\s+(number|no\.?)\b",
+    r"\bcredit\s+card\s+(number|no\.?|#)\b",
+    r"\b(annual\s+)?(salary|compensation|payroll)\b",
+    r"\bpassword\b",
+    r"\bhome\s+address\b",
+    r"\bprivate\s+(key|credential)\b",
+    # ── Korean PII ────────────────────────────────────────────────────────
     r"주민등록번호",
     r"주민번호",
     r"연봉",
@@ -1351,10 +1365,22 @@ PII_PATTERNS = [
 ]
 
 INJECTION_PATTERNS = [
-    r"반드시\s*.+\s*(적어라|써라|출력해라|출력하라|말해라)",
+    # ── English injection ─────────────────────────────────────────────────
+    r"ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|directives?|rules?)",
+    r"disregard\s+(all\s+)?(previous|prior|above|your)\s+(instructions?|prompts?|directives?|rules?)",
+    r"you\s+are\s+now\s+(a|an|the)\b",
+    r"pretend\s+(you\s+are|to\s+be)\b",
+    r"act\s+as\s+(a|an|the)\b",
+    r"\bjailbreak\b",
+    r"\bDAN\s+mode\b",
+    r"\bdeveloper\s+mode\b",
+    r"system\s*prompt\s*:",
+    # ── Common ───────────────────────────────────────────────────────────
     r"APPROVED_BY_ADMIN",
+    r"\[SYSTEM\s+DIRECTIVE",
+    # ── Korean injection ──────────────────────────────────────────────────
+    r"반드시\s*.+\s*(적어라|써라|출력해라|출력하라|말해라)",
     r"(무시|ignore).{0,10}(지시|instruction)",
-    r"system\s*:",
     r"이전\s*(지시|명령|프롬프트).*무시",
 ]
 
@@ -1379,6 +1405,7 @@ def _sanitize_question(question: str) -> str:
 _BLOCK_INJECTION_PATTERNS = [
     r"\[SYSTEM DIRECTIVE.*?\[END DIRECTIVE\]",
     r"\[SYSTEM\].*?\[/SYSTEM\]",
+    r"<\s*system\s*>.*?<\s*/system\s*>",
     r"<!--.*?-->",
 ]
 
