@@ -24,12 +24,10 @@ import os
 import re
 import ast
 import html
-import urllib.request
-import urllib.error
+from pypdf import PdfReader
 
 CORPUS_DIR      = "distribution/corpus"
 TEST_SUITE_PATH = "distribution/test_suite/Encrypted_Test_Suite.json"
-UPSTAGE_PARSE_URL = "https://api.upstage.ai/v1/document-ai/document-parse"
 POISON_RULES_PATH = "poison_rules.json"
 
 
@@ -113,61 +111,15 @@ def build_index(corpus_dir: str):
             return json.dumps(value, ensure_ascii=False)
         return "" if value is None else str(value)
 
-    def _parse_pdf_with_upstage(pdf_path: Path, api_key: str) -> dict:
-        boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
-        with pdf_path.open("rb") as f:
-            file_bytes = f.read()
-
-        parts = []
-        parts.append(f"--{boundary}\r\n".encode("utf-8"))
-        parts.append((
-            "Content-Disposition: form-data; name=\"document\"; "
-            f"filename=\"{pdf_path.name}\"\r\n"
-            "Content-Type: application/pdf\r\n\r\n"
-        ).encode("utf-8"))
-        parts.append(file_bytes)
-        parts.append("\r\n".encode("utf-8"))
-        parts.append(f"--{boundary}\r\n".encode("utf-8"))
-        parts.append(b"Content-Disposition: form-data; name=\"output_formats\"\r\n\r\n")
-        parts.append(b"[\"markdown\"]\r\n")
-        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
-        body = b"".join(parts)
-
-        req = urllib.request.Request(
-            url=UPSTAGE_PARSE_URL,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Upstage Parse API 오류 [{e.code}]: {detail}") from e
-
+    def _parse_pdf_with_pypdf(pdf_path: Path) -> dict:
+        reader = PdfReader(str(pdf_path))
         pages = []
-        for p in payload.get("pages", []):
-            page_no = p.get("page") or p.get("page_num") or p.get("id") or 0
-            md = _as_text(p.get("markdown") or p.get("text") or p.get("content") or "")
-            pages.append({"page": int(page_no) if str(page_no).isdigit() else 0, "markdown": md})
-
-        if not pages:
-            whole = _as_text(payload.get("markdown") or payload.get("content") or payload.get("text") or "")
-            if whole.strip():
-                pages = [{"page": 1, "markdown": whole}]
-
+        for i, page in enumerate(reader.pages, start=1):
+            txt = page.extract_text() or ""
+            pages.append({"page": i, "markdown": _normalize(txt)})
         if not pages:
             raise RuntimeError(f"문서 파싱 결과가 비어 있습니다: {pdf_path.name}")
-
-        norm_pages = []
-        for i, p in enumerate(pages, start=1):
-            page_no = p["page"] if p["page"] > 0 else i
-            norm_pages.append({"page": page_no, "markdown": p["markdown"]})
-        return {"source": pdf_path.name, "pages": norm_pages}
+        return {"source": pdf_path.name, "pages": pages}
 
     def _strip_page_markers(text: str) -> str:
         return re.sub(r"(?m)^\[\[PAGE:\s*\d+\]\]\s*$", "", text).strip()
@@ -780,14 +732,11 @@ def build_index(corpus_dir: str):
         # 이메일은 짧은 답장도 의미가 있어서 공격적 드롭 금지
         return [c for c in chunks if c.get("text", "").strip()]
 
-    api_key = os.environ.get("UPSTAGE_API_KEY")
-    if not api_key:
-        raise EnvironmentError("UPSTAGE_API_KEY가 설정되지 않았습니다. source set_env.sh 또는 set_env.ps1로 설정하세요.")
-
     target_tokens = 500
     overlap_tokens = 90
     split_threshold_words = 900
     split_target_words = 500
+    batch_size = int(os.environ.get("PARSER_BATCH_SIZE", "25"))
 
     pdf_files = sorted(Path(corpus_dir).glob("*.pdf"))
     all_chunks = []
@@ -800,8 +749,12 @@ def build_index(corpus_dir: str):
 
     source_stats = {}
 
-    for pdf_path in pdf_files:
-        parsed = _parse_pdf_with_upstage(pdf_path, api_key)
+    for i, pdf_path in enumerate(pdf_files):
+        if i % batch_size == 0:
+            bno = i // batch_size + 1
+            bcount = len(pdf_files[i:i + batch_size])
+            print(f"[build_index] processing batch {bno}: {bcount} files")
+        parsed = _parse_pdf_with_pypdf(pdf_path)
         source = parsed["source"]
 
         full_text = "\n\n".join(

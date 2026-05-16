@@ -3,7 +3,7 @@ pandas>=2.0.0          # submission.csv 생성 및 검증 (validator, upstage_tr
 cryptography>=42.0.0   # AES-256-GCM 복호화 (decryptor.py)
 
 # ── PDF 파싱 (하나 선택) ─────────────────────────────────────────────────
-# pypdf>=4.0.0          # 텍스트 레이어 추출, 경량
+pypdf>=4.0.0          # 텍스트 레이어 추출, 경량
 # pdfplumber>=0.10.0    # 표·레이아웃 추출에 강함
 # (Upstage Document Parse API 사용 시 별도 설치 불필요)
 
