@@ -20,7 +20,6 @@ import re
 import glob
 import json
 import uuid
-import time
 import pickle
 from pathlib import Path
 import ast
@@ -33,6 +32,7 @@ import numpy as np
 import requests
 from rank_bm25 import BM25Okapi
 import chromadb
+from pypdf import PdfReader
 
 from decryptor import load_test_suite
 from upstage_tracker import UpstageTracker
@@ -48,9 +48,9 @@ CHROMA_PERSIST_DIR = ".index_chroma"
 BM25_CACHE_PATH    = ".index_bm25.pkl"
 CHUNKS_CACHE_PATH  = ".index_chunks.pkl"
 MAX_TOKENS         = 512
-EMBED_BATCH_SIZE   = 32
-EMBED_MODEL_DOC    = "solar-embedding-1-large-passage"
-EMBED_MODEL_QUERY  = "solar-embedding-1-large-query"
+EMBED_BATCH_SIZE   = 128
+EMBED_MODEL_NAME   = "BAAI/bge-small-en-v1.5"
+BGE_QUERY_PREFIX   = "Represent this sentence for searching relevant passages: "
 MAX_ANSWER_CHARS   = 1200
 
 # 출력 민감정보 패턴
@@ -196,61 +196,30 @@ def _chunk_elements(elements: list[dict], source: str, max_tokens: int = MAX_TOK
     return chunks
 
 
-def _build_embed_text(chunk: dict) -> str:
-    """청크에 구조 컨텍스트 prefix를 붙여 임베딩용 텍스트를 생성한다.
-
-    원본 텍스트는 그대로 BM25 / ChromaDB documents 에 저장되고,
-    이 함수의 결과만 embedding API 에 전달된다.
-    """
-    heading_path = chunk.get("heading_path", [])
-    parts = [f"문서: {chunk['source']}"]
-    if heading_path:
-        parts.append("섹션: " + " > ".join(heading_path))
-    parts.append(f"페이지: {chunk['page']}")
-    parts.append(f"유형: {chunk['category']}")
-    prefix = "[" + " | ".join(parts) + "]\n"
-    return prefix + chunk["text"]
 
 
-def _embed_with_upstage(
-    texts: list[str],
-    api_key: str,
-    model: str = EMBED_MODEL_DOC,
-) -> list[list[float]]:
-    """Upstage Embedding API 배치 호출 (rate-limit 대비 재시도 포함)"""
-    url = f"{UPSTAGE_BASE_URL}/solar/embeddings"
-    all_embeddings: list[list[float]] = []
+_embed_model = None
 
-    for i in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch = texts[i : i + EMBED_BATCH_SIZE]
-        payload = json.dumps({"model": model, "input": batch}, ensure_ascii=False).encode()
+def _get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        from sentence_transformers import SentenceTransformer
+        print(f"  임베딩 모델 로딩: {EMBED_MODEL_NAME}")
+        _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    return _embed_model
 
-        for attempt in range(3):
-            req = urllib.request.Request(
-                url=url,
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    result = json.loads(resp.read().decode("utf-8"))
-                break
-            except urllib.error.HTTPError as e:
-                if e.code == 429 and attempt < 2:
-                    time.sleep(2 ** attempt)
-                    continue
-                raise RuntimeError(
-                    f"Embedding API 오류 [{e.code}]: {e.read().decode()}"
-                ) from e
-
-        data = sorted(result["data"], key=lambda x: x["index"])
-        all_embeddings.extend(d["embedding"] for d in data)
-        print(f"    임베딩 진행: {min(i + EMBED_BATCH_SIZE, len(texts))}/{len(texts)}")
-
-    return all_embeddings
+def _embed_texts(texts: list[str], is_query: bool = False) -> list[list[float]]:
+    """로컬 BGE 모델로 임베딩 생성. 쿼리 시 BGE prefix 추가."""
+    model = _get_embed_model()
+    if is_query:
+        texts = [BGE_QUERY_PREFIX + t for t in texts]
+    embeddings = model.encode(
+        texts,
+        batch_size=EMBED_BATCH_SIZE,
+        show_progress_bar=len(texts) > 100,
+        normalize_embeddings=True,
+    )
+    return embeddings.tolist()
 
 
 def _email_parse_and_chunk(corpus_dir: str):
@@ -310,80 +279,15 @@ def _email_parse_and_chunk(corpus_dir: str):
     def _word_count(text: str) -> int:
         return len(text.split())
 
-    def _as_text(value) -> str:
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            chunks = []
-            for v in value:
-                t = _as_text(v)
-                if t.strip():
-                    chunks.append(t)
-            return "\n".join(chunks).strip()
-        if isinstance(value, dict):
-            for k in ("markdown", "text", "content", "body", "value"):
-                if k in value:
-                    t = _as_text(value[k])
-                    if t.strip():
-                        return t
-            return json.dumps(value, ensure_ascii=False)
-        return "" if value is None else str(value)
-
-    def _parse_pdf_with_upstage(pdf_path: Path, api_key: str) -> dict:
-        boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
-        with pdf_path.open("rb") as f:
-            file_bytes = f.read()
-
-        parts = []
-        parts.append(f"--{boundary}\r\n".encode("utf-8"))
-        parts.append((
-            "Content-Disposition: form-data; name=\"document\"; "
-            f"filename=\"{pdf_path.name}\"\r\n"
-            "Content-Type: application/pdf\r\n\r\n"
-        ).encode("utf-8"))
-        parts.append(file_bytes)
-        parts.append("\r\n".encode("utf-8"))
-        parts.append(f"--{boundary}\r\n".encode("utf-8"))
-        parts.append(b"Content-Disposition: form-data; name=\"output_formats\"\r\n\r\n")
-        parts.append(b"[\"markdown\"]\r\n")
-        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
-        body = b"".join(parts)
-
-        req = urllib.request.Request(
-            url=UPSTAGE_PARSE_URL,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Upstage Parse API 오류 [{e.code}]: {detail}") from e
-
+    def _parse_pdf_with_pypdf(pdf_path: Path) -> dict:
+        reader = PdfReader(str(pdf_path))
         pages = []
-        for p in payload.get("pages", []):
-            page_no = p.get("page") or p.get("page_num") or p.get("id") or 0
-            md = _as_text(p.get("markdown") or p.get("text") or p.get("content") or "")
-            pages.append({"page": int(page_no) if str(page_no).isdigit() else 0, "markdown": md})
-
-        if not pages:
-            whole = _as_text(payload.get("markdown") or payload.get("content") or payload.get("text") or "")
-            if whole.strip():
-                pages = [{"page": 1, "markdown": whole}]
-
+        for i, page in enumerate(reader.pages, start=1):
+            txt = page.extract_text() or ""
+            pages.append({"page": i, "markdown": _normalize(txt)})
         if not pages:
             raise RuntimeError(f"문서 파싱 결과가 비어 있습니다: {pdf_path.name}")
-
-        norm_pages = []
-        for i, p in enumerate(pages, start=1):
-            page_no = p["page"] if p["page"] > 0 else i
-            norm_pages.append({"page": page_no, "markdown": p["markdown"]})
-        return {"source": pdf_path.name, "pages": norm_pages}
+        return {"source": pdf_path.name, "pages": pages}
 
     def _strip_page_markers(text: str) -> str:
         return re.sub(r"(?m)^\[\[PAGE:\s*\d+\]\]\s*$", "", text).strip()
@@ -621,7 +525,7 @@ def _email_parse_and_chunk(corpus_dir: str):
             if tokens[:half] == tokens[half:]:
                 s = " ".join(tokens[:half])
         # generic repeated phrase collapse
-        m = re.match(r"^(.*?)\\s+\\1$", s, flags=re.IGNORECASE)
+        m = re.match(r"^(.*?)\s+\1$", s, flags=re.IGNORECASE)
         if m:
             s = m.group(1).strip()
         return s
@@ -887,7 +791,7 @@ def _email_parse_and_chunk(corpus_dir: str):
 
         # "... writes to the ... List:" pattern
         m_writes = re.search(
-            r'(?i)^\\s*"?([^"<]+)"?\\s*<\\s*([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\s*>\\s+writes\\s+to\\s+the',
+            r'(?i)^\s*"?([^"<]+)"?\s*<\s*([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\s*>\s+writes\s+to\s+the',
             v,
         )
         if m_writes:
@@ -963,9 +867,9 @@ def _email_parse_and_chunk(corpus_dir: str):
         w = body.split()
         if len(w) > 45:
             return False
-        email_n = len(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", body))
-        phone_n = len(re.findall(r"\\b\\d{3}[- .]\\d{3}[- .]\\d{4}\\b", body))
-        org_n = len(re.findall(r"(?i)\\b(enron|company|services|corporation|fax|phone)\\b", body))
+        email_n = len(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", body))
+        phone_n = len(re.findall(r"\b\d{3}[- .]\d{3}[- .]\d{4}\b", body))
+        org_n = len(re.findall(r"(?i)\b(enron|company|services|corporation|fax|phone)\b", body))
         sentence_n = len(re.findall(r"[.!?]", body))
         return (email_n + phone_n + org_n >= 3) and sentence_n <= 1
 
@@ -996,14 +900,11 @@ def _email_parse_and_chunk(corpus_dir: str):
         # 이메일은 짧은 답장도 의미가 있어서 공격적 드롭 금지
         return [c for c in chunks if c.get("text", "").strip()]
 
-    api_key = os.environ.get("UPSTAGE_API_KEY")
-    if not api_key:
-        raise EnvironmentError("UPSTAGE_API_KEY가 설정되지 않았습니다. source set_env.sh 또는 set_env.ps1로 설정하세요.")
-
-    target_tokens = 500
-    overlap_tokens = 90
-    split_threshold_words = 900
-    split_target_words = 500
+    # 158개 파일(~34MB), 예상 청크 8,000~15,000개 기준 튜닝값
+    target_tokens         = 500   # _split_by_token_limit 내부 단위 (words)
+    overlap_tokens        = 50    # 분할 청크 간 겹침 (words) — 이메일은 독립 단위라 최소화
+    split_threshold_words = 700   # 이 값 초과 시 분할 (dasovich 4.9MB 등 대형 파일 대응)
+    split_target_words    = 350   # 분할 청크 목표 크기 (words)
 
     pdf_files = sorted(Path(corpus_dir).glob("*.pdf"))
     all_chunks = []
@@ -1016,8 +917,11 @@ def _email_parse_and_chunk(corpus_dir: str):
 
     source_stats = {}
 
-    for pdf_path in pdf_files:
-        parsed = _parse_pdf_with_upstage(pdf_path, api_key)
+    n_files = len(pdf_files)
+    for file_idx, pdf_path in enumerate(pdf_files):
+        if file_idx % 25 == 0:
+            print(f"  [parse] {file_idx}/{n_files} 파일 처리 중...")
+        parsed = _parse_pdf_with_pypdf(pdf_path)
         source = parsed["source"]
 
         full_text = "\n\n".join(
@@ -1243,13 +1147,6 @@ def _email_parse_and_chunk(corpus_dir: str):
         ch["metadata"]["chunk_index"] = idx
         ch["metadata"]["chunk_id"] = f"{src}::c{idx}"
 
-    artifacts_path = Path("artifacts/chunks.preview.jsonl")
-    artifacts_path.parent.mkdir(parents=True, exist_ok=True)
-    if not artifacts_path.exists():
-        with artifacts_path.open("w", encoding="utf-8") as f:
-            for ch in all_chunks:
-                f.write(json.dumps(ch, ensure_ascii=False) + "\n")
-
     # validations
     for src, st in source_stats.items():
         src_chunks = [c for c in all_chunks if c["metadata"]["source"] == src]
@@ -1395,14 +1292,14 @@ def _email_parse_and_chunk(corpus_dir: str):
 
 
 def build_index(corpus_dir: str):
-    """3단계 캐시 전략: BM25/ChromaDB pickles → artifacts JSONL → Parse API."""
+    """캐시 전략: BM25/ChromaDB pickles → corpus 직접 파싱."""
     api_key = os.environ.get("UPSTAGE_API_KEY")
     if not api_key:
         raise EnvironmentError(
             "UPSTAGE_API_KEY가 설정되지 않았습니다. source set_env.sh 또는 set_env.ps1로 설정하세요."
         )
 
-    # ── Tier 1: BM25/ChromaDB pickle cache ──────────────────────────────
+    # ── pickle 캐시 ───────────────────────────────────────────────────────
     if (Path(BM25_CACHE_PATH).exists() and Path(CHUNKS_CACHE_PATH).exists()
             and Path(CHROMA_PERSIST_DIR).exists()):
         print("  [build_index] 캐시된 인덱스를 로드합니다...")
@@ -1415,45 +1312,25 @@ def build_index(corpus_dir: str):
         print(f"  로드 완료: {len(chunks)}개 청크")
         return {"api_key": api_key, "bm25": bm25, "chunks": chunks, "collection": collection}
 
-    # ── Tier 2: artifacts JSONL cache ────────────────────────────────────
-    _artifacts_path = Path("artifacts/chunks.preview.jsonl")
-    raw_chunks = None
-    if _artifacts_path.exists():
-        print(f"  artifacts 청크 캐시 로드: {_artifacts_path}")
-        raw_chunks = []
-        with _artifacts_path.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    raw_chunks.append(json.loads(line))
-        print(f"  → {len(raw_chunks)}개 청크 로드 완료")
+    # ── corpus 직접 파싱 ──────────────────────────────────────────────────
+    result = _email_parse_and_chunk(corpus_dir)
+    raw_chunks = result["chunks"]  # [{"text": ..., "metadata": {...}}, ...]
 
-    # ── Tier 3: Parse API ─────────────────────────────────────────────────
-    if raw_chunks is None:
-        result = _email_parse_and_chunk(corpus_dir)
-        raw_chunks = result["chunks"]
-
-    # ── Normalize chunk format (metadata 중첩 → 플랫) ────────────────────
     chunks = []
     for c in raw_chunks:
-        if "metadata" in c and isinstance(c["metadata"], dict):
-            md = c["metadata"]
-            chunks.append({
-                "text":         c["text"],
-                "source":       md.get("source", "unknown"),
-                "page":         md.get("page", 1),
-                "category":     "email",
-                "heading_path": [],
-            })
-        else:
-            chunks.append(c)
+        md = c.get("metadata", {})
+        chunks.append({
+            "text":    c["text"],
+            "source":  md.get("source", "unknown"),
+            "page":    md.get("page", 1),
+        })
 
     # ── BM25 ─────────────────────────────────────────────────────────────
     print("  BM25 인덱스 생성 중...")
-    tokenized = [c["text"].lower().split() for c in chunks]
-    bm25 = BM25Okapi(tokenized)
+    bm25 = BM25Okapi([c["text"].lower().split() for c in chunks])
 
-    # ── ChromaDB ─────────────────────────────────────────────────────────
+    # ── ChromaDB (Upstage 임베딩) ─────────────────────────────────────────
+    print("  임베딩 생성 중...")
     client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
     try:
         client.delete_collection("chunks")
@@ -1461,13 +1338,11 @@ def build_index(corpus_dir: str):
         pass
     collection = client.create_collection("chunks")
 
-    embed_texts = [_build_embed_text(c) for c in chunks]
-    embeddings  = _embed_with_upstage(embed_texts, api_key)
-    ids         = [str(i) for i in range(len(chunks))]
+    embeddings = _embed_texts([c["text"] for c in chunks])
     collection.add(
-        ids         = ids,
-        embeddings  = embeddings,
-        metadatas   = [{"source": c["source"]} for c in chunks],
+        ids=       [str(i) for i in range(len(chunks))],
+        embeddings=embeddings,
+        metadatas= [{"source": c["source"]} for c in chunks],
     )
 
     # ── pickle 캐시 저장 ──────────────────────────────────────────────────
@@ -1652,9 +1527,8 @@ def _hybrid_retrieve(question: str, index, top_k: int) -> list[dict]:
     bm25       = index["bm25"]
     chunks     = index["chunks"]
     collection = index["collection"]
-    api_key    = index["api_key"]
 
-    candidate_n = top_k * 3  # 후보 넉넉하게
+    candidate_n = 30   # 158개 파일 대형 코퍼스 기준 — BM25·Dense 각 30개 후보
     k_rrf = 60
 
     # BM25 + Dense 병렬 실행
@@ -1664,7 +1538,7 @@ def _hybrid_retrieve(question: str, index, top_k: int) -> list[dict]:
         return {str(i): rank for rank, i in enumerate(ranked)}  # id는 str(숫자)
 
     def _dense_search():
-        q_emb = _embed_with_upstage([question], api_key, model=EMBED_MODEL_QUERY)[0]
+        q_emb = _embed_texts([question], is_query=True)[0]
         result = collection.query(
             query_embeddings=[q_emb],
             n_results=candidate_n,
@@ -1857,7 +1731,7 @@ def generate_answer(
             messages      = messages,
             token         = token,
             system_prompt = SYSTEM_PROMPT,
-            max_tokens    = 200,
+            max_tokens    = 300,
         )
     except Exception as exc:
         # 2차 시도: 컨텍스트 축약 후 재시도 (문서8에서 가져옴)
@@ -1870,7 +1744,7 @@ def generate_answer(
                 messages      = short_messages,
                 token         = token,
                 system_prompt = SYSTEM_PROMPT,
-                max_tokens    = 200,
+                max_tokens    = 300,
             )
         except Exception as exc2:
             print(f"  [warn] {question_id} 2차 생성도 실패: {exc2}")

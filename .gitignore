@@ -3,3 +3,4 @@ __pycache__/
 .index_chroma/
 distribution/sample_corpus/
 *.pkl
+*.pdf
