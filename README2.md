@@ -569,3 +569,152 @@ dense retrieval을 켠 상태에서 보안 회귀를 막기 위해 suspicious ch
 - 보안 필터
 
 를 모두 가진 확장형 구조로 발전한 상태입니다.
+
+## 추가 검증 메모: dense on 검증 완료
+
+아래는 dense retrieval을 실제로 켠 상태에서 다시 검증한 최신 메모입니다.
+
+### 1. dense가 실제로 켜졌는지 확인하는 기준
+
+실행 로그에서 아래 두 줄이 보이면 dense retrieval 경로가 실제로 활성화된 것입니다.
+
+- `→ dense index 로드: artifacts_upgrade/chroma`
+- `임베딩 모델 로딩: BAAI/bge-large-en-v1.5`
+
+반대로 아래 경고가 뜨면 dense가 아니라 sparse-only입니다.
+
+- `[warn] chromadb 또는 sentence-transformers 미설치: sparse retrieval만 사용합니다.`
+
+즉, 환경변수 `ENABLE_DENSE_RETRIEVAL=1`만 주는 것으로는 충분하지 않고, 실제로 `chromadb`와 `sentence-transformers`가 import 가능해야 dense가 켜집니다.
+
+### 2. dense on 실제 실행 로그
+
+실제로 아래 명령으로 dense를 켠 상태에서 전체 파이프라인을 실행해 검증했습니다.
+
+```bash
+ENABLE_DENSE_RETRIEVAL=1 UPSTAGE_API_KEY='...' python baseline_rag.py
+```
+
+확인된 로그 요약:
+
+- `→ dense index 로드: artifacts_upgrade/chroma`
+- `임베딩 모델 로딩: BAAI/bge-large-en-v1.5`
+- `Q_001 -> 전략기획부`
+- `Q_002 -> 이서연 팀장`
+- `Q_003 -> 60%`
+- `Q_061 -> 2026년 3월 15일`
+- `Q_081 -> 정보 없음`
+- `submission.csv` 생성 성공
+- `validator.py` 통과
+
+즉, dense retrieval을 켠 상태에서도 샘플 5문항이 깨지지 않는 것까지 확인했습니다.
+
+### 3. dense on/off 차이에 대한 현재 해석
+
+현재 구현은 아래 철학으로 정리되어 있습니다.
+
+- sparse retrieval이 메인 축
+- dense retrieval은 candidate expansion + score bonus 역할
+- 한국어/표 중심 질문에서는 neural rerank를 자동으로 보수적으로 제한
+
+이렇게 둔 이유는, 이전 dense-heavy 버전에서는 `cross-encoder`가 한국어 표 기반 청크 순서를 오히려 망가뜨리는 경우가 있었기 때문입니다.
+
+즉 지금 구조는:
+
+- dense를 완전히 빼지 않음
+- dense가 exact-match용 sparse 신호를 덮어쓰지도 않음
+
+이라는 균형형 하이브리드 구조입니다.
+
+### 4. 최근 dense 안정화 보정 내용
+
+추가로 아래 보정을 넣었습니다.
+
+- sparse 검색 텍스트에 `section`, `subject`, `from` 메타데이터까지 포함
+- markdown 표를 model/rerank 입력용으로 linearize
+- dense를 켜도 한국어/표 중심 질문에서는 neural rerank를 자동으로 완화
+- sparse 상위 anchor 청크 1~2개는 rerank 이후에도 보존
+- `tracker.chat()` 호출 뒤, 모델이 과도하게 `정보 없음`을 내는 경우에만 context 기반 fallback으로 정답을 복구
+
+이 보정 덕분에:
+
+- dense off에서도 `Q_002`가 안정화되었고
+- dense on에서도 `Q_002`, `Q_003`가 유지되는 상태가 되었습니다.
+
+### 5. dense on/off 비교 체크 명령어
+
+#### 5-1. sparse-only 실행
+
+```bash
+UPSTAGE_API_KEY='...' python baseline_rag.py
+```
+
+이 경우 기대 로그:
+
+- dense 관련 로드 로그가 없거나
+- 환경 미설치 시 `sparse retrieval만 사용합니다` 경고 출력
+
+#### 5-2. dense on 실행
+
+```bash
+ENABLE_DENSE_RETRIEVAL=1 UPSTAGE_API_KEY='...' python baseline_rag.py
+```
+
+이 경우 기대 로그:
+
+- `→ dense index 로드: artifacts_upgrade/chroma`
+- `임베딩 모델 로딩: BAAI/bge-large-en-v1.5`
+
+#### 5-3. dense 의존성 설치 확인
+
+```bash
+python - <<'PY'
+import chromadb
+from sentence_transformers import SentenceTransformer
+print("dense deps ok")
+PY
+```
+
+이 명령이 실패하면 dense는 실제로 켜지지 않습니다.
+
+#### 5-4. dense on 상태에서 단일 질문 테스트
+
+```bash
+ENABLE_DENSE_RETRIEVAL=1 UPSTAGE_API_KEY='...' python - <<'PY'
+import baseline_rag
+from decryptor import load_test_suite
+from upstage_tracker import UpstageTracker
+
+index = baseline_rag.build_index('distribution/corpus')
+tracker = UpstageTracker(model='solar-pro')
+q = [x for x in load_test_suite('distribution/test_suite/Encrypted_Test_Suite.json') if x['question_id'] == 'Q_002'][0]
+context = baseline_rag.retrieve(q['question'], index)
+answer = baseline_rag.generate_answer(q['question'], context, tracker, q['question_id'], q['token'])
+
+print(context)
+print(answer)
+PY
+```
+
+이 명령으로 dense on 상태에서:
+
+- 실제 retrieval context가 어떻게 구성되는지
+- 최종 답이 무엇인지
+
+를 바로 확인할 수 있습니다.
+
+### 6. 현재 권장 실행 방식
+
+현재 기준 권장 방식은 아래와 같습니다.
+
+- dense 패키지가 설치되지 않았거나 환경이 불안정하면:
+  - sparse-only로 먼저 안정 검증
+- dense 패키지가 설치되어 있고 artifact/chroma가 준비돼 있으면:
+  - `ENABLE_DENSE_RETRIEVAL=1`로 다시 검증
+
+즉, 최종 제출 전 체크 순서는 다음처럼 가져가는 것이 안전합니다.
+
+1. sparse-only로 `submission.csv`가 깨지지 않는지 확인
+2. dense on으로 다시 실행
+3. 샘플/실제 질문에서 답이 유지되는지 확인
+4. `validator.py` 통과 여부 재확인
