@@ -1,11 +1,15 @@
 # ── 필수 패키지 (반드시 설치) ───────────────────────────────────────────
 pandas>=2.0.0          # submission.csv 생성 및 검증 (validator, upstage_tracker)
 cryptography>=42.0.0   # AES-256-GCM 복호화 (decryptor.py)
+numpy>=1.26.0          # 임베딩 행렬 연산 (upstage_client, baseline_rag)
+pypdf>=4.0.0           # PDF 페이지 분할 (Document Parse 호출 단위 ~80p)
+pymupdf>=1.24.0        # 로컬 PDF 파싱 (fitz)
+rank-bm25>=0.2.2       # BM25 sparse retrieval
+scikit-learn>=1.4.0,<1.7.0  # TF-IDF sparse retrieval
+certifi>=2024.0.0      # macOS SSL 인증서 보강
 
-# ── PDF 파싱 (하나 선택) ─────────────────────────────────────────────────
-# pypdf>=4.0.0          # 텍스트 레이어 추출, 경량
+# ── PDF 파싱 보조 (선택) ─────────────────────────────────────────────────
 # pdfplumber>=0.10.0    # 표·레이아웃 추출에 강함
-# (Upstage Document Parse API 사용 시 별도 설치 불필요)
 
 # ── Vector DB (하나 선택) ────────────────────────────────────────────────
 # chromadb>=0.4.0
